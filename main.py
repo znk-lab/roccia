@@ -941,7 +941,9 @@ async def slash_top(interaction: discord.Interaction):
     ranking = sorted(data.get("xp", {}).items(), key=lambda t: t[1], reverse=True)[:10]
     lines = []
     for i, (uid, xp) in enumerate(ranking, 1):
-        lines.append(f"{i}. <{uid}> — {xp} XP")
+        user = interaction.guild.get_member(int(uid))
+        name = user.display_name if user else f"Usuário {uid}"
+        lines.append(f"{i}. {name} — {xp} XP")
     text = "\n".join(lines) if lines else "Sem dados ainda."
     await interaction.followup.send(f"🏆 **Top 10 XP**\n{text}")
 
