@@ -21,8 +21,8 @@ from PIL import Image, ImageDraw, ImageFont
 # -------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_USER = os.getenv("GITHUB_USER", "znk-lab")
-GITHUB_REPO = os.getenv("GITHUB_REPO", "roccia1")
+GITHUB_USER = os.getenv("GITHUB_USER", "pobonsanto-byte")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "imune-bot-data")
 DATA_FILE = os.getenv("DATA_FILE", "data.json")
 BRANCH = os.getenv("GITHUB_BRANCH", "main")
 PORT = int(os.getenv("PORT", 8080))
@@ -478,66 +478,77 @@ async def on_message(message: discord.Message):
 
     uid = str(message.author.id)
     content = message.content.strip()
-    delete_message = False  # Flag para saber se devemos deletar e não dar XP
+    delete_message = False
 
     # -------- IGNORAR COMANDOS DO MUDAE --------
-    mudae_commands = ["$w", "$wa", "$wg", "$h", "$ha", "$hg", "$W", "$WA", "$WG", "$H", "$HA", "$HG", "$tu", "$TU", "$dk", "$mmi", "$vote", "$rolls", "$k", "$mu"]
+    mudae_commands = [
+        "$w", "$wa", "$wg", "$h", "$ha", "$hg",
+        "$W", "$WA", "$WG", "$H", "$HA", "$HG",
+        "$tu", "$TU", "$dk", "$mmi", "$vote", "$rolls", "$k", "$mu"
+    ]
     if any(content.lower().startswith(cmd) for cmd in mudae_commands):
-        # ignora advertências e XP para mensagens da Mudae
         await bot.process_commands(message)
         return
+
+    # -------- IGNORAR ADVERTÊNCIAS PARA ADM E MOD --------
+    ignored_roles = {"Administrador", "Moderador"}
+    member_roles = {r.name for r in message.author.roles}
+    is_staff = any(role in ignored_roles for role in member_roles)
 
     # -------- BLOQUEIO DE LINKS --------
     blocked_channels = data.get("blocked_links_channels", [])
     if message.channel.id in blocked_channels:
         import re
-        url_pattern = r"https?://[^\s]+"  # Regex simples para detectar links
+        url_pattern = r"https?://[^\s]+"
         if re.search(url_pattern, content):
-            try:
-                await message.delete()
-            except discord.Forbidden:
-                pass
-            await message.channel.send(f"⚠️ {message.author.mention}, links não são permitidos aqui!")
-            await add_warn(message.author, reason="Enviou link em canal bloqueado")
-            return  # Sai do evento — não ganha XP nem continua processando
+            if not is_staff:
+                try:
+                    await message.delete()
+                except discord.Forbidden:
+                    pass
+                await message.channel.send(f"⚠️ {message.author.mention}, links não são permitidos aqui!")
+                await add_warn(message.author, reason="Enviou link em canal bloqueado")
+                return
+            # Staff ignora advertência, mas ganha XP
             
 
-    # -------- ANTI-SPAM / HISTÓRICO DE MENSAGENS --------
+    # -------- ANTI-SPAM --------
     user_msgs = data.setdefault("last_messages_content", {}).setdefault(uid, [])
     if len(user_msgs) >= 5:
         user_msgs.pop(0)
 
     if user_msgs and content == user_msgs[-1]:
-        delete_message = True
-        try:
-            await message.delete()
-        except discord.Forbidden:
-            pass
-        await message.channel.send(f"⚠️ {message.author.mention}, evite enviar mensagens repetidas!")
-        await add_warn(message.author, reason="Spam detectado")
+        if not is_staff:
+            delete_message = True
+            try:
+                await message.delete()
+            except discord.Forbidden:
+                pass
+            await message.channel.send(f"⚠️ {message.author.mention}, evite enviar mensagens repetidas!")
+            await add_warn(message.author, reason="Spam detectado")
+            return
     else:
         user_msgs.append(content)
     data["last_messages_content"][uid] = user_msgs
 
-
     # -------- DETECÇÃO DE MAIÚSCULAS --------
     if len(content) > 5 and content.isupper():
-        delete_message = True
-        try:
-            await message.delete()
-        except discord.Forbidden:
-            pass
-        await message.channel.send(f"⚠️ {message.author.mention}, evite escrever tudo em maiúsculas!")
-        await add_warn(message.author, reason="Uso excessivo de maiúsculas")
-
+        if not is_staff:
+            delete_message = True
+            try:
+                await message.delete()
+            except discord.Forbidden:
+                pass
+            await message.channel.send(f"⚠️ {message.author.mention}, evite escrever tudo em maiúsculas!")
+            await add_warn(message.author, reason="Uso excessivo de maiúsculas")
+            return
 
     # -------- SISTEMA DE XP (mais lento para upar) --------
     if not delete_message:
         data.setdefault("xp", {})
         data.setdefault("level", {})
 
-        # Reduz o XP ganho por mensagem
-        xp_rate = data.get("config", {}).get("xp_rate", 1)  # padrão = 1x (normal)
+        xp_rate = data.get("config", {}).get("xp_rate", 3)  # Mais difícil de upar (3x mais lento)
         xp_gain = max(1, xp_for_message() // xp_rate)
         data["xp"][uid] = data["xp"].get(uid, 0) + xp_gain
 
@@ -555,14 +566,14 @@ async def on_message(message: discord.Message):
             if levelup_channel_id:
                 channel_to_send = message.guild.get_channel(int(levelup_channel_id))
             if not channel_to_send:
-                channel_to_send = message.channel  # fallback: usa o canal atual se nenhum configurado
+                channel_to_send = message.channel
 
             try:
                 await channel_to_send.send(f"🎉 {message.author.mention} subiu para o nível **{lvl_now}**!")
             except Exception as e:
                 print(f"Erro ao enviar mensagem de level up: {e}")
-            
-            # Verifica se há cargo vinculado a este nível
+
+            # -------- CARGO POR NÍVEL --------
             level_roles = data.get("level_roles", {})
             role_id = level_roles.get(str(lvl_now))
             if role_id:
@@ -570,12 +581,10 @@ async def on_message(message: discord.Message):
                 if role:
                     try:
                         await message.author.add_roles(role, reason=f"Alcançou nível {lvl_now}")
-                        #await channel_to_send.send(f"🎉 {message.author.mention} recebeu o cargo {role.mention}!")
                     except discord.Forbidden:
                         await channel_to_send.send(f"⚠️ Não consegui dar o cargo {role.mention}, verifique minhas permissões.")
-                        
-            add_log(f"level_up: user={uid} level={lvl_now}")
 
+            add_log(f"level_up: user={uid} level={lvl_now}")
 
     # -------- SALVAR DADOS --------
     try:
@@ -584,6 +593,7 @@ async def on_message(message: discord.Message):
         print(f"Erro ao salvar XP: {e}")
 
     await bot.process_commands(message)
+
 
 
 # -------------------------
