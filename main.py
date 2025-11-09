@@ -481,7 +481,7 @@ async def on_message(message: discord.Message):
     delete_message = False  # Flag para saber se devemos deletar e não dar XP
 
     # -------- IGNORAR COMANDOS DO MUDAE --------
-    mudae_commands = ["$w", "$wa", "$wg", "$h", "$ha", "$hg", "$W", "$WA", "$WG", "$H", "$HA", "$HG", "$tu", "$TU", "$dk", "$mmi", "$vote", "$rolls", "$k"]
+    mudae_commands = ["$w", "$wa", "$wg", "$h", "$ha", "$hg", "$W", "$WA", "$WG", "$H", "$HA", "$HG", "$tu", "$TU", "$dk", "$mmi", "$vote", "$rolls", "$k", "$mu"]
     if any(content.lower().startswith(cmd) for cmd in mudae_commands):
         # ignora advertências e XP para mensagens da Mudae
         await bot.process_commands(message)
