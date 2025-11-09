@@ -21,8 +21,8 @@ from PIL import Image, ImageDraw, ImageFont
 # -------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_USER = os.getenv("GITHUB_USER", "znk-lab")
-GITHUB_REPO = os.getenv("GITHUB_REPO", "roccia1")
+GITHUB_USER = os.getenv("GITHUB_USER", "pobonsanto-byte")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "imune-bot-data")
 DATA_FILE = os.getenv("DATA_FILE", "data.json")
 BRANCH = os.getenv("GITHUB_BRANCH", "main")
 PORT = int(os.getenv("PORT", 8080))
@@ -480,6 +480,13 @@ async def on_message(message: discord.Message):
     content = message.content.strip()
     delete_message = False  # Flag para saber se devemos deletar e não dar XP
 
+    # -------- IGNORAR COMANDOS DO MUDAE --------
+    mudae_commands = ["$w", "$wa", "$wg", "$h", "$ha", "$hg", "$W", "$WA", "$WG", "$H", "$HA", "$HG", "$tu", "$TU", "$dk", "$mmi", "$vote", "$rolls", "$k"]
+    if any(content.lower().startswith(cmd) for cmd in mudae_commands):
+        # ignora advertências e XP para mensagens da Mudae
+        await bot.process_commands(message)
+        return
+
     # -------- BLOQUEIO DE LINKS --------
     blocked_channels = data.get("blocked_links_channels", [])
     if message.channel.id in blocked_channels:
@@ -524,11 +531,15 @@ async def on_message(message: discord.Message):
         await add_warn(message.author, reason="Uso excessivo de maiúsculas")
 
 
-    # -------- SISTEMA DE XP --------
+    # -------- SISTEMA DE XP (mais lento para upar) --------
     if not delete_message:
         data.setdefault("xp", {})
         data.setdefault("level", {})
-        data["xp"][uid] = data["xp"].get(uid, 0) + xp_for_message()
+
+        # Reduz o XP ganho por mensagem
+        xp_rate = data.get("config", {}).get("xp_rate", 1)  # padrão = 1x (normal)
+        xp_gain = max(1, xp_for_message() // xp_rate)
+        data["xp"][uid] = data["xp"].get(uid, 0) + xp_gain
 
         xp_now = data["xp"][uid]
         lvl_now = xp_to_level(xp_now)
@@ -550,7 +561,19 @@ async def on_message(message: discord.Message):
                 await channel_to_send.send(f"🎉 {message.author.mention} subiu para o nível **{lvl_now}**!")
             except Exception as e:
                 print(f"Erro ao enviar mensagem de level up: {e}")
-
+            
+            # Verifica se há cargo vinculado a este nível
+            level_roles = data.get("level_roles", {})
+            role_id = level_roles.get(str(lvl_now))
+            if role_id:
+                role = message.guild.get_role(int(role_id))
+                if role:
+                    try:
+                        await message.author.add_roles(role, reason=f"Alcançou nível {lvl_now}")
+                        #await channel_to_send.send(f"🎉 {message.author.mention} recebeu o cargo {role.mention}!")
+                    except discord.Forbidden:
+                        await channel_to_send.send(f"⚠️ Não consegui dar o cargo {role.mention}, verifique minhas permissões.")
+                        
             add_log(f"level_up: user={uid} level={lvl_now}")
 
 
@@ -561,6 +584,7 @@ async def on_message(message: discord.Message):
         print(f"Erro ao salvar XP: {e}")
 
     await bot.process_commands(message)
+
 
 # -------------------------
 # Slash commands
@@ -578,6 +602,49 @@ def is_command_allowed(interaction: discord.Interaction, command_name: str) -> b
     if not allowed:
         return True
     return interaction.channel_id in allowed
+
+
+#/cargo_xp
+
+@tree.command(name="cargo_xp", description="Define um cargo para ser atribuído ao atingir certo nível (admin)")
+@app_commands.describe(level="Nível em que o cargo será dado", role="Cargo a ser atribuído")
+async def set_level_role(interaction: discord.Interaction, level: int, role: discord.Role):
+    if not is_admin_check(interaction):
+        await interaction.response.send_message("❌ Você não tem permissão.", ephemeral=True)
+        return
+
+    if level < 1:
+        await interaction.response.send_message("⚠️ O nível deve ser maior que 0.", ephemeral=True)
+        return
+
+    data.setdefault("level_roles", {})[str(level)] = str(role.id)
+    save_data_to_github("Set level role")
+
+    await interaction.response.send_message(
+        f"✅ Cargo {role.mention} será atribuído ao atingir o **nível {level}**.",
+        ephemeral=False
+    )
+
+
+# -------------------------
+# /setxprate — ajusta a taxa de ganho de XP
+# -------------------------
+@tree.command(name="xp_rate", description="Define a taxa de ganho de XP (admin)")
+@app_commands.describe(rate="Taxa de XP — valores menores tornam o up mais lento (ex: 1 = normal, 2 = 2x mais difícil, 4 = 4x mais difícil)")
+async def set_xp_rate(interaction: discord.Interaction, rate: int):
+    if not is_admin_check(interaction):
+        await interaction.response.send_message("❌ Você não tem permissão para usar este comando.", ephemeral=True)
+        return
+
+    if rate < 1:
+        await interaction.response.send_message("⚠️ O valor mínimo é 1.", ephemeral=True)
+        return
+
+    data.setdefault("config", {})["xp_rate"] = rate
+    save_data_to_github("Set XP rate")
+
+    await interaction.response.send_message(f"✅ Taxa de XP ajustada para **x{rate}**. Agora é **{rate}x mais difícil** subir de nível.", ephemeral=False)
+
 
 #/mensagem_personalizada
 @tree.command(name="mensagem_personalizada", description="Cria uma mensagem personalizada (admin)")
