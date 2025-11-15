@@ -21,8 +21,8 @@ from PIL import Image, ImageDraw, ImageFont
 # -------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_USER = os.getenv("GITHUB_USER", "znk-lab")
-GITHUB_REPO = os.getenv("GITHUB_REPO", "roccia1")
+GITHUB_USER = os.getenv("GITHUB_USER", "pobonsanto-byte")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "imune-bot-data")
 DATA_FILE = os.getenv("DATA_FILE", "data.json")
 BRANCH = os.getenv("GITHUB_BRANCH", "main")
 PORT = int(os.getenv("PORT", 8080))
@@ -495,6 +495,26 @@ async def on_message(message: discord.Message):
     member_roles = {r.name for r in message.author.roles}
     is_staff = any(role in ignored_roles for role in member_roles)
 
+    # -------- IGNORAR MÍDIA (imagem, vídeo, gif, sticker, arquivo) --------
+    has_media = False
+
+    # Imagens/vídeos/arquivos
+    if message.attachments:
+        has_media = True
+
+    # Stickers
+    if message.stickers:
+        has_media = True
+
+    # GIFs de sites conhecidos
+    gif_domains = ["tenor.com", "media.tenor.com", "giphy.com", "imgur.com"]
+    if any(domain in content.lower() for domain in gif_domains):
+        has_media = True
+
+    if has_media:
+        await bot.process_commands(message)
+        return
+
     # -------- BLOQUEIO DE LINKS --------
     blocked_channels = data.get("blocked_links_channels", [])
     if message.channel.id in blocked_channels:
@@ -509,8 +529,6 @@ async def on_message(message: discord.Message):
                 await message.channel.send(f"⚠️ {message.author.mention}, links não são permitidos aqui!")
                 await add_warn(message.author, reason="Enviou link em canal bloqueado")
                 return
-            # Staff ignora advertência, mas ganha XP
-            
 
     # -------- ANTI-SPAM --------
     user_msgs = data.setdefault("last_messages_content", {}).setdefault(uid, [])
@@ -543,12 +561,12 @@ async def on_message(message: discord.Message):
             await add_warn(message.author, reason="Uso excessivo de maiúsculas")
             return
 
-    # -------- SISTEMA DE XP (mais lento para upar) --------
+    # -------- SISTEMA DE XP --------
     if not delete_message:
         data.setdefault("xp", {})
         data.setdefault("level", {})
 
-        xp_rate = data.get("config", {}).get("xp_rate", 3)  # Mais difícil de upar (3x mais lento)
+        xp_rate = data.get("config", {}).get("xp_rate", 3)
         xp_gain = max(1, xp_for_message() // xp_rate)
         data["xp"][uid] = data["xp"].get(uid, 0) + xp_gain
 
@@ -559,7 +577,6 @@ async def on_message(message: discord.Message):
         if lvl_now > prev_lvl:
             data["level"][uid] = lvl_now
 
-            # Canal configurável de level up
             levelup_channel_id = data.get("config", {}).get("levelup_channel")
             channel_to_send = None
 
@@ -573,7 +590,6 @@ async def on_message(message: discord.Message):
             except Exception as e:
                 print(f"Erro ao enviar mensagem de level up: {e}")
 
-            # -------- CARGO POR NÍVEL --------
             level_roles = data.get("level_roles", {})
             role_id = level_roles.get(str(lvl_now))
             if role_id:
@@ -582,7 +598,9 @@ async def on_message(message: discord.Message):
                     try:
                         await message.author.add_roles(role, reason=f"Alcançou nível {lvl_now}")
                     except discord.Forbidden:
-                        await channel_to_send.send(f"⚠️ Não consegui dar o cargo {role.mention}, verifique minhas permissões.")
+                        await channel_to_send.send(
+                            f"⚠️ Não consegui dar o cargo {role.mention}, verifique minhas permissões."
+                        )
 
             add_log(f"level_up: user={uid} level={lvl_now}")
 
@@ -593,7 +611,6 @@ async def on_message(message: discord.Message):
         print(f"Erro ao salvar XP: {e}")
 
     await bot.process_commands(message)
-
 
 
 # -------------------------
