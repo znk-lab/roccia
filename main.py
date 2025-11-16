@@ -21,8 +21,8 @@ from PIL import Image, ImageDraw, ImageFont
 # -------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_USER = os.getenv("GITHUB_USER", "znk-lab")
-GITHUB_REPO = os.getenv("GITHUB_REPO", "roccia1")
+GITHUB_USER = os.getenv("GITHUB_USER", "pobonsanto-byte")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "imune-bot-data")
 DATA_FILE = os.getenv("DATA_FILE", "data.json")
 BRANCH = os.getenv("GITHUB_BRANCH", "main")
 PORT = int(os.getenv("PORT", 8080))
@@ -550,16 +550,16 @@ async def on_message(message: discord.Message):
     data["last_messages_content"][uid] = user_msgs
 
     # -------- DETECÇÃO DE MAIÚSCULAS --------
-    if len(content) > 5 and content.isupper():
-        if not is_staff:
-            delete_message = True
-            try:
-                await message.delete()
-            except discord.Forbidden:
-                pass
-            await message.channel.send(f"⚠️ {message.author.mention}, evite escrever tudo em maiúsculas!")
-            await add_warn(message.author, reason="Uso excessivo de maiúsculas")
-            return
+    #if len(content) > 5 and content.isupper():
+        #if not is_staff:
+            #delete_message = True
+           # try:
+            #    await message.delete()
+           # except discord.Forbidden:
+            #    pass
+           # await message.channel.send(f"⚠️ {message.author.mention}, evite escrever tudo em maiúsculas!")
+          #  await add_warn(message.author, reason="Uso excessivo de maiúsculas")
+           # return
 
     # -------- SISTEMA DE XP --------
     if not delete_message:
