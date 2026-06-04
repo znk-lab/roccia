@@ -22,8 +22,8 @@ from PIL import Image, ImageDraw, ImageFont
 # ========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_USER = os.getenv("GITHUB_USER", "znk-lab")
-GITHUB_REPO = os.getenv("GITHUB_REPO", "roccia")
+GITHUB_USER = os.getenv("GITHUB_USER", "pobonsanto-byte")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "imune-bot-data")
 DATA_FILE = os.getenv("DATA_FILE", "data.json")
 BRANCH = os.getenv("GITHUB_BRANCH", "main")
 PORT = int(os.getenv("PORT", 8080))
@@ -79,8 +79,8 @@ dados = {
         "taxa_xp": 3,
         "canal_levelup": None,
         "canal_logs": None,
-        "canal_perfil": None,  # Canal onde o /perfil pode ser usado
-        "canal_rank": None     # Canal onde o /rank pode ser usado
+        "canal_perfil": None,
+        "canal_rank": None
     },
     "logs": [],
     "fila": {
@@ -92,6 +92,10 @@ dados = {
     "cargos_nivel": {},
     "canais_links_bloqueados": [],
     "botoes_cargos": {},
+    "links_fila": {  # NOVO: links para o site da fila
+        "discord_convite": "",
+        "tabela_precos": ""
+    },
     "anti_spam": {
         "ativado": True,
         "limite_mensagens": 5,
@@ -146,6 +150,8 @@ def carregar_dados_github():
                     dados["cargos_nivel"] = {}
                 if "canais_links_bloqueados" not in dados:
                     dados["canais_links_bloqueados"] = []
+                if "links_fila" not in dados:
+                    dados["links_fila"] = {"discord_convite": "", "tabela_precos": ""}
                 if "anti_spam" not in dados:
                     dados["anti_spam"] = {
                         "ativado": True,
@@ -372,7 +378,7 @@ def obter_dados_fila():
 def salvar_fila():
     return salvar_dados_github("Atualização da fila")
 
-def adicionar_fila(nome_usuario: str, servico: str, usuario_id: str = None):
+def adicionar_fila(nome_usuario: str, servico: str, jogo: str = "", usuario_id: str = None):
     fila = obter_dados_fila()
     
     if not fila["configuracoes"]["aberta"]:
@@ -389,6 +395,7 @@ def adicionar_fila(nome_usuario: str, servico: str, usuario_id: str = None):
         "id": str(int(datetime.now().timestamp() * 1000)),
         "nome_usuario": nome_usuario,
         "servico": servico,
+        "jogo": jogo,  # NOVO: campo para o jogo
         "usuario_id": usuario_id or nome_usuario,
         "timestamp": agora_br().isoformat(),
         "status": "aguardando",
@@ -398,7 +405,7 @@ def adicionar_fila(nome_usuario: str, servico: str, usuario_id: str = None):
     fila["entradas"].append(entrada)
     atualizar_posicoes(fila["entradas"])
     salvar_fila()
-    adicionar_log(f"fila_adicionar: {nome_usuario} - {servico}")
+    adicionar_log(f"fila_adicionar: {nome_usuario} - {servico} - {jogo}")
     return True, entrada
 
 def remover_fila(entrada_id: str):
@@ -489,6 +496,20 @@ def definir_nome_fila(nome: str):
     fila["nome"] = nome[:50]
     salvar_fila()
     return fila["nome"]
+
+# ========================
+# FUNÇÕES PARA LINKS DA FILA
+# ========================
+def obter_links_fila():
+    dados.setdefault("links_fila", {"discord_convite": "", "tabela_precos": ""})
+    return dados["links_fila"]
+
+def salvar_links_fila(discord_convite: str, tabela_precos: str):
+    dados["links_fila"] = {
+        "discord_convite": discord_convite or "",
+        "tabela_precos": tabela_precos or ""
+    }
+    return salvar_dados_github("Links da fila atualizados")
 
 # ========================
 # SISTEMA DE AÇÕES DO SITE
@@ -748,12 +769,11 @@ async def executar_acao_bot_interno(acao):
         
         elif tipo_acao == "configurar_comandos":
             config = dados.setdefault("config", {})
-            # Lógica de toggle: se o canal selecionado for o mesmo que já está configurado, remove a configuração
             if 'canal_perfil' in dados_acao:
                 canal_perfil_atual = config.get("canal_perfil")
                 novo_canal_perfil = dados_acao['canal_perfil']
                 if novo_canal_perfil and canal_perfil_atual == novo_canal_perfil:
-                    config["canal_perfil"] = None  # Remove a configuração (toggle off)
+                    config["canal_perfil"] = None
                 else:
                     config["canal_perfil"] = novo_canal_perfil if novo_canal_perfil else None
             
@@ -761,7 +781,7 @@ async def executar_acao_bot_interno(acao):
                 canal_rank_atual = config.get("canal_rank")
                 novo_canal_rank = dados_acao['canal_rank']
                 if novo_canal_rank and canal_rank_atual == novo_canal_rank:
-                    config["canal_rank"] = None  # Remove a configuração (toggle off)
+                    config["canal_rank"] = None
                 else:
                     config["canal_rank"] = novo_canal_rank if novo_canal_rank else None
             
@@ -990,6 +1010,7 @@ def logout():
 @app.route("/fila")
 def fila_publica():
     fila = obter_dados_fila()
+    links = obter_links_fila()
     return f'''
     <!DOCTYPE html>
     <html>
@@ -1006,11 +1027,18 @@ def fila_publica():
             .status {{ display:inline-block; padding:5px 15px; border-radius:20px; }}
             .status-aberta {{ background:#00b894; }}
             .status-fechada {{ background:#d63031; }}
+            .links-container {{ display: flex; justify-content: center; gap: 20px; margin: 20px 0; flex-wrap: wrap; }}
+            .btn-link {{ display: inline-flex; align-items: center; gap: 10px; padding: 12px 24px; border-radius: 30px; text-decoration: none; font-weight: bold; transition: all 0.3s; }}
+            .btn-link-discord {{ background: #5865F2; color: white; }}
+            .btn-link-discord:hover {{ background: #4752C4; transform: translateY(-2px); }}
+            .btn-link-precos {{ background: #f59e0b; color: white; }}
+            .btn-link-precos:hover {{ background: #d97706; transform: translateY(-2px); }}
             .lista-fila {{ background:rgba(0,0,0,0.4); border-radius:20px; overflow:hidden; }}
-            .cabecalho-fila {{ display:grid; grid-template-columns:60px 1fr 1fr 80px; padding:15px; background:rgba(255,255,255,0.1); font-weight:bold; }}
-            .item-fila {{ display:grid; grid-template-columns:60px 1fr 1fr 80px; padding:12px 15px; border-bottom:1px solid rgba(255,255,255,0.1); }}
+            .cabecalho-fila {{ display:grid; grid-template-columns:60px 1fr 1fr 1fr 80px; padding:15px; background:rgba(255,255,255,0.1); font-weight:bold; }}
+            .item-fila {{ display:grid; grid-template-columns:60px 1fr 1fr 1fr 80px; padding:12px 15px; border-bottom:1px solid rgba(255,255,255,0.1); }}
             .posicao {{ font-weight:bold; color:#ffd93d; }}
             .servico {{ color:#a8e6cf; }}
+            .jogo {{ color:#ffb347; }}
             .vazio {{ text-align:center; padding:40px; }}
             .footer {{ text-align:center; margin-top:20px; font-size:0.8rem; color:#888; }}
         </style>
@@ -1022,9 +1050,15 @@ def fila_publica():
                 <span class="status status-{'aberta' if fila['configuracoes']['aberta'] else 'fechada'}">{'🟢 ABERTA' if fila['configuracoes']['aberta'] else '🔴 FECHADA'}</span>
                 <div>📊 {len(fila["entradas"])} / {fila["configuracoes"]["tamanho_maximo"]} pessoas</div>
             </div>
+            
+            <div class="links-container">
+                {'<a href="' + escape_html(links["discord_convite"]) + '" target="_blank" class="btn-link btn-link-discord">💬 Entrar no Discord</a>' if links.get("discord_convite") else ''}
+                {'<a href="' + escape_html(links["tabela_precos"]) + '" target="_blank" class="btn-link btn-link-precos">💰 Ver Preços</a>' if links.get("tabela_precos") else ''}
+            </div>
+            
             <div class="lista-fila">
-                <div class="cabecalho-fila"><span>#</span><span>Jogador</span><span>Serviço</span><span></span></div>
-                {''.join(f'<div class="item-fila"><span class="posicao">{e["posicao"]}</span><span>{escape_html(e["nome_usuario"])}</span><span class="servico">{escape_html(e["servico"])}</span><span>⏳</span></div>' for e in fila["entradas"]) or '<div class="vazio">✨ Ninguém na fila</div>'}
+                <div class="cabecalho-fila"><span>#</span><span>Jogador</span><span>Serviço</span><span>Jogo</span><span></span></div>
+                {''.join(f'<div class="item-fila"><span class="posicao">{e["posicao"]}</span><span>{escape_html(e["nome_usuario"])}</span><span class="servico">{escape_html(e["servico"])}</span><span class="jogo">{escape_html(e.get("jogo", ""))}</span><span>⏳</span></div>' for e in fila["entradas"]) or '<div class="vazio">✨ Ninguém na fila</div>'}
             </div>
             <div class="footer">Atualizado a cada 30s • {agora_br().strftime("%d/%m/%Y %H:%M:%S")}</div>
         </div>
@@ -1037,7 +1071,7 @@ def fila_embed():
     fila = obter_dados_fila()
     entradas_html = ""
     for e in fila["entradas"][:10]:
-        entradas_html += f'<div style="display:flex;justify-content:space-between;padding:5px 0;"><span style="color:#ffd93d;">#{e["posicao"]}</span><span>{escape_html(e["nome_usuario"])}</span><span style="color:#a8e6cf;">{escape_html(e["servico"])}</span></div>'
+        entradas_html += f'<div style="display:flex;justify-content:space-between;padding:5px 0;"><span style="color:#ffd93d;">#{e["posicao"]}</span><span>{escape_html(e["nome_usuario"])}</span><span style="color:#a8e6cf;">{escape_html(e["servico"])}</span><span style="color:#ffb347;">{escape_html(e.get("jogo", ""))}</span></div>'
     if not entradas_html:
         entradas_html = '<div style="text-align:center;padding:20px;">✨ Fila vazia</div>'
     return f'''
@@ -1057,7 +1091,7 @@ def fila_api():
             "aberta": fila["configuracoes"]["aberta"],
             "tamanho_maximo": fila["configuracoes"]["tamanho_maximo"],
             "contagem": len(fila["entradas"]),
-            "entradas": [{"posicao": e["posicao"], "nome_usuario": e["nome_usuario"], "servico": e["servico"], "timestamp": e["timestamp"], "id": e["id"]} for e in fila["entradas"]]
+            "entradas": [{"posicao": e["posicao"], "nome_usuario": e["nome_usuario"], "servico": e["servico"], "jogo": e.get("jogo", ""), "timestamp": e["timestamp"], "id": e["id"]} for e in fila["entradas"]]
         }
     })
 
@@ -1070,9 +1104,10 @@ def api_fila_adicionar():
     dados_req = request.json
     nome = dados_req.get("nome_usuario", "").strip()
     servico = dados_req.get("servico", "").strip()
+    jogo = dados_req.get("jogo", "").strip()
     if not nome or not servico:
         return jsonify({"sucesso": False, "mensagem": "Nome e serviço são obrigatórios"})
-    sucesso, resultado = adicionar_fila(nome, servico)
+    sucesso, resultado = adicionar_fila(nome, servico, jogo)
     return jsonify({"sucesso": sucesso, "mensagem": f"{nome} adicionado!" if sucesso else resultado})
 
 @app.route("/api/fila/remover", methods=["POST"])
@@ -1114,7 +1149,8 @@ def api_fila_limpar():
 def api_fila_configuracoes():
     if request.method == "GET":
         fila = obter_dados_fila()
-        return jsonify({"sucesso": True, "configuracoes": fila["configuracoes"], "nome": fila["nome"]})
+        links = obter_links_fila()
+        return jsonify({"sucesso": True, "configuracoes": fila["configuracoes"], "nome": fila["nome"], "links": links})
     if 'usuario' not in session:
         return jsonify({"sucesso": False}), 401
     req = request.json
@@ -1124,6 +1160,8 @@ def api_fila_configuracoes():
         definir_tamanho_maximo(int(req["tamanho_maximo"]))
     if "nome" in req:
         definir_nome_fila(req["nome"])
+    if "discord_convite" in req or "tabela_precos" in req:
+        salvar_links_fila(req.get("discord_convite", ""), req.get("tabela_precos", ""))
     return jsonify({"sucesso": True})
 
 # ========================
@@ -1331,6 +1369,7 @@ def dashboard():
     config = dados.get("config", {})
     fila = obter_dados_fila()
     anti_spam = dados.get("anti_spam", {})
+    links = obter_links_fila()
     
     return f'''
     <!DOCTYPE html>
@@ -1694,6 +1733,19 @@ def dashboard():
                         <div><label>Nome da Fila</label><input type="text" id="fila-nome" class="form-control" value="{escape_html(fila['nome'])}"></div>
                         <div><label>Tamanho Máximo</label><input type="number" id="fila-max" class="form-control" value="{fila['configuracoes']['tamanho_maximo']}" min="1" max="100"></div>
                     </div>
+                    
+                    <h3 style="margin-top: 20px;">🔗 Links do Site da Fila</h3>
+                    <div class="grid-2">
+                        <div class="form-group">
+                            <label>Link do Discord (convite)</label>
+                            <input type="url" id="link-discord" class="form-control" placeholder="https://discord.gg/seuconvite" value="{escape_html(links.get('discord_convite', ''))}">
+                        </div>
+                        <div class="form-group">
+                            <label>Link da Tabela de Preços</label>
+                            <input type="url" id="link-precos" class="form-control" placeholder="https://seusite.com/precos" value="{escape_html(links.get('tabela_precos', ''))}">
+                        </div>
+                    </div>
+                    
                     <div style="display: flex; gap: 1rem; margin-top: 1rem;">
                         <button onclick="salvarConfigFila()" class="btn btn-primary">💾 Salvar</button>
                         <button onclick="alternarStatusFila()" id="toggle-fila-btn" class="btn {'btn-success' if fila['configuracoes']['aberta'] else 'btn-danger'}">{'🔓 Fechar Fila' if fila['configuracoes']['aberta'] else '🔒 Abrir Fila'}</button>
@@ -1704,9 +1756,10 @@ def dashboard():
                 
                 <div class="card">
                     <h2>➕ Adicionar à Fila</h2>
-                    <div style="display: flex; gap: 1rem;">
+                    <div style="display: flex; gap: 1rem; flex-wrap: wrap;">
                         <input type="text" id="add-nome" class="form-control" placeholder="Nome do jogador" style="flex:1;">
                         <input type="text" id="add-servico" class="form-control" placeholder="Serviço" style="flex:1;">
+                        <input type="text" id="add-jogo" class="form-control" placeholder="Jogo" style="flex:1;">
                         <button onclick="adicionarFila()" class="btn btn-primary">➕ Adicionar</button>
                     </div>
                     <div id="add-result" class="alert" style="margin-top: 10px; display: none;"></div>
@@ -1717,10 +1770,10 @@ def dashboard():
                     <div style="overflow-x: auto;">
                         <table style="width:100%">
                             <thead>
-                                <tr><th>#</th><th>Jogador</th><th>Serviço</th><th>Entrada</th><th>Ações</th></tr>
+                                <tr><th>#</th><th>Jogador</th><th>Serviço</th><th>Jogo</th><th>Entrada</th><th>Ações</th></tr>
                             </thead>
-                            <tbody id="fila-tabela"><tr><td colspan="5">Carregando...</td></tr></tbody>
-                        </table>
+                            <tbody id="fila-tabela"><tr><td colspan="6">Carregando...</td></tr></tbody>
+                         </table>
                     </div>
                     <div style="margin-top: 10px;"><button onclick="atualizarFila()" class="btn btn-primary">🔄 Atualizar</button></div>
                 </div>
@@ -1768,7 +1821,7 @@ def dashboard():
             
             async function carregarDados() {{
                 try {{
-                    const [canaisRes, cargosRes, membrosRes, configBoasVindas, configXP, linksRes, antiSpamRes, configComandosRes] = await Promise.all([
+                    const [canaisRes, cargosRes, membrosRes, configBoasVindas, configXP, linksRes, antiSpamRes, configComandosRes, filaConfigRes] = await Promise.all([
                         fetch('/api/servidor/canais'),
                         fetch('/api/servidor/cargos'),
                         fetch('/api/servidor/membros'),
@@ -1776,7 +1829,8 @@ def dashboard():
                         fetch('/api/config/xp'),
                         fetch('/api/config/links'),
                         fetch('/api/anti_spam'),
-                        fetch('/api/config/comandos')
+                        fetch('/api/config/comandos'),
+                        fetch('/api/fila/configuracoes')
                     ]);
                     
                     const canaisData = await canaisRes.json();
@@ -1787,6 +1841,7 @@ def dashboard():
                     const linksData = await linksRes.json();
                     const antiSpamData = await antiSpamRes.json();
                     const configComandosData = await configComandosRes.json();
+                    const filaConfig = await filaConfigRes.json();
                     
                     if (canaisData.sucesso) canais = canaisData.canais;
                     if (cargosData.sucesso) cargos = cargosData.cargos;
@@ -1846,6 +1901,11 @@ def dashboard():
                         const listaDiv = document.getElementById('lista-comandos');
                         const comandos = antiSpamData.config.comandos_ignorados.split(',');
                         listaDiv.innerHTML = comandos.map(c => `<span style="background:#333; padding:4px 12px; border-radius:20px;">${{c.trim()}}</span>`).join('');
+                    }}
+                    
+                    if (filaConfig.sucesso && filaConfig.links) {{
+                        document.getElementById('link-discord').value = filaConfig.links.discord_convite || '';
+                        document.getElementById('link-precos').value = filaConfig.links.tabela_precos || '';
                     }}
                     
                     carregarCargosNivel();
@@ -1972,11 +2032,9 @@ def dashboard():
                 const canalPerfil = document.getElementById('canal-perfil').value;
                 const canalRank = document.getElementById('canal-rank').value;
                 
-                // Lógica de toggle no frontend
                 let perfilFinal = canalPerfil;
                 let rankFinal = canalRank;
                 
-                // Se o canal selecionado for o mesmo que já estava configurado, envia vazio para remover
                 if (canalPerfil && configAtual.canal_perfil === canalPerfil) {{
                     perfilFinal = '';
                 }}
@@ -1993,9 +2051,7 @@ def dashboard():
                     const result = await resp.json();
                     showAlert('comandos-alert', result.mensagem, result.sucesso);
                     if (result.sucesso) {{
-                        // Atualiza a configuração atual
                         if (perfilFinal !== canalPerfil) {{
-                            // Removeu a configuração
                             document.getElementById('canal-perfil').value = '';
                             atualizarStatusPerfil('');
                             configAtual.canal_perfil = '';
@@ -2212,13 +2268,14 @@ def dashboard():
                         const fila = data.fila;
                         const tbody = document.getElementById('fila-tabela');
                         if (fila.entradas.length === 0) {{
-                            tbody.innerHTML = '<tr><td colspan="5">📭 Ninguém na fila</td></tr>';
+                            tbody.innerHTML = '<tr><td colspan="6">📭 Ninguém na fila</td></tr>';
                         }} else {{
                             tbody.innerHTML = fila.entradas.map(e => `
                                 <tr>
                                     <td><strong style="color:#ffd93d;">#${{e.posicao}}</strong></td>
                                     <td>${{escapeHtml(e.nome_usuario)}}</td>
                                     <td style="color:#a8e6cf;">${{escapeHtml(e.servico)}}</td>
+                                    <td style="color:#ffb347;">${{escapeHtml(e.jogo || '')}}</td>
                                     <td>${{new Date(e.timestamp).toLocaleTimeString()}}</td>
                                     <td>
                                         <button onclick="moverCima('${{e.id}}')" class="btn btn-primary" style="padding:4px 8px;">⬆️</button>
@@ -2226,10 +2283,13 @@ def dashboard():
                                         <button onclick="concluir('${{e.id}}')" class="btn btn-success" style="padding:4px 8px;">✅</button>
                                         <button onclick="remover('${{e.id}}')" class="btn btn-danger" style="padding:4px 8px;">❌</button>
                                     </td>
-                                </tr>
+                                </td>
                             `).join('');
                         }}
-                        document.getElementById('fila-status').innerHTML = `Status: ${{fila.aberta ? '🟢 ABERTA' : '🔴 FECHADA'}} | ${{fila.contagem}}/${{fila.tamanho_maximo}}`;
+                        const filaStatus = document.getElementById('fila-status');
+                        if (filaStatus) {{
+                            filaStatus.innerHTML = `Status: ${{fila.aberta ? '🟢 ABERTA' : '🔴 FECHADA'}} | ${{fila.contagem}}/${{fila.tamanho_maximo}}`;
+                        }}
                         const toggleBtn = document.getElementById('toggle-fila-btn');
                         if (toggleBtn) {{
                             toggleBtn.className = fila.aberta ? 'btn btn-danger' : 'btn btn-success';
@@ -2242,17 +2302,19 @@ def dashboard():
             async function adicionarFila() {{
                 const nome = document.getElementById('add-nome').value.trim();
                 const servico = document.getElementById('add-servico').value.trim();
+                const jogo = document.getElementById('add-jogo').value.trim();
                 if (!nome || !servico) {{
                     showAlert('add-result', 'Preencha nome e serviço', false);
                     return;
                 }}
                 try {{
-                    const resp = await fetch('/api/fila/adicionar', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{nome_usuario: nome, servico}})}});
+                    const resp = await fetch('/api/fila/adicionar', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{nome_usuario: nome, servico, jogo}})}});
                     const data = await resp.json();
                     showAlert('add-result', data.mensagem, data.sucesso);
                     if (data.sucesso) {{
                         document.getElementById('add-nome').value = '';
                         document.getElementById('add-servico').value = '';
+                        document.getElementById('add-jogo').value = '';
                         carregarFila();
                     }}
                 }} catch(e) {{ showAlert('add-result', 'Erro: ' + e.message, false); }}
@@ -2263,7 +2325,17 @@ def dashboard():
             async function moverBaixo(id) {{ await fetch('/api/fila/mover-baixo', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{entrada_id:id}})}}); carregarFila(); }}
             async function concluir(id) {{ if (confirm('Concluir serviço?')) {{ await fetch('/api/fila/concluir', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{entrada_id:id}})}}); carregarFila(); }} }}
             async function limparFila() {{ if (confirm('LIMPAR TODA A FILA?')) {{ await fetch('/api/fila/limpar', {{method:'POST'}}); carregarFila(); }} }}
-            async function salvarConfigFila() {{ await fetch('/api/fila/configuracoes', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{nome: document.getElementById('fila-nome').value, tamanho_maximo: parseInt(document.getElementById('fila-max').value)}})}}); carregarFila(); }}
+            async function salvarConfigFila() {{ 
+                const data = {{
+                    nome: document.getElementById('fila-nome').value,
+                    tamanho_maximo: parseInt(document.getElementById('fila-max').value),
+                    discord_convite: document.getElementById('link-discord').value,
+                    tabela_precos: document.getElementById('link-precos').value
+                }};
+                await fetch('/api/fila/configuracoes', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(data)}});
+                carregarFila();
+                showAlert('fila-status', 'Configurações salvas!', true);
+            }}
             async function alternarStatusFila() {{ await fetch('/api/fila/configuracoes', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{aberta:null}})}}); carregarFila(); }}
             function atualizarFila() {{ carregarFila(); }}
             
@@ -2301,11 +2373,9 @@ async def verificar_canal_permitido(interaction: discord.Interaction, comando: s
     config = dados.get("config", {})
     canal_permitido = config.get(f"canal_{comando}", None)
     
-    # Se não houver canal configurado, permite em todos os canais
     if not canal_permitido:
         return True
     
-    # Verifica se o canal atual é o permitido
     if str(interaction.channel_id) == str(canal_permitido):
         return True
     
@@ -2318,7 +2388,6 @@ async def verificar_canal_permitido(interaction: discord.Interaction, comando: s
 @tree.command(name="perfil", description="Mostra o seu perfil com XP e nível")
 @app_commands.describe(membro="Membro para ver o perfil (opcional)")
 async def slash_perfil(interaction: discord.Interaction, membro: discord.Member = None):
-    # Verifica se o comando pode ser usado neste canal
     if not await verificar_canal_permitido(interaction, "perfil"):
         config = dados.get("config", {})
         canal_permitido = config.get("canal_perfil")
@@ -2399,7 +2468,6 @@ async def slash_perfil(interaction: discord.Interaction, membro: discord.Member 
 
 @tree.command(name="rank", description="Mostra o ranking dos 10 maiores XP")
 async def slash_rank(interaction: discord.Interaction):
-    # Verifica se o comando pode ser usado neste canal
     if not await verificar_canal_permitido(interaction, "rank"):
         config = dados.get("config", {})
         canal_permitido = config.get("canal_rank")
@@ -2525,12 +2593,15 @@ async def on_ready():
     iniciar_processador_acoes()
     
     config = dados.get("config", {})
+    links = obter_links_fila()
     print(f"{'='*50}")
     print(f"✨ BOT PRONTO! Comandos: /perfil e /rank")
     print(f"🛡️ Anti-Spam: {'ATIVADO' if dados.get('anti_spam', {}).get('ativado', True) else 'DESATIVADO'}")
     print(f"🚫 Comandos da Mudae: NÃO ganham XP e NÃO contam como spam")
     print(f"📢 Canal do /perfil: {config.get('canal_perfil') or 'TODOS OS CANAIS'}")
     print(f"📢 Canal do /rank: {config.get('canal_rank') or 'TODOS OS CANAIS'}")
+    if links.get('discord_convite') or links.get('tabela_precos'):
+        print(f"🔗 Links da fila configurados")
     print(f"💡 Dica: Selecione o mesmo canal duas vezes no painel para remover a restrição!")
     print(f"{'='*50}\n")
 
@@ -2659,58 +2730,39 @@ async def on_message(message: discord.Message):
     conteudo = message.content.strip()
     anti_spam_config = dados.get("anti_spam", {})
     
-    # ========================
-    # VERIFICAR SE É COMANDO IGNORADO (ex: Mudae)
-    # ========================
     eh_comando_ignorado = verificar_comando_ignorado(conteudo)
     
-    # Se for comando ignorado, NÃO processa anti-spam e NÃO dá XP
     if eh_comando_ignorado:
-        # Apenas processa comandos do bot se houver
         await bot.process_commands(message)
         return
     
-    # ========================
-    # ANTI-SPAM (apenas para mensagens que NÃO são comandos ignorados)
-    # ========================
     if anti_spam_config.get("ativado", True):
-        # Verifica se o membro tem cargo ignorado
         if not verificar_cargo_ignorado(message.author):
-            # Registra a mensagem e verifica limite
             quantidade = registrar_mensagem(message.author.id)
             limite = anti_spam_config.get("limite_mensagens", 5)
             
             if quantidade > limite:
-                # Aplica mute
                 duracao = anti_spam_config.get("tempo_mute_minutos", 2)
                 sucesso = await aplicar_mute(message.author, duracao)
                 
                 if sucesso:
-                    # Deleta as mensagens de spam
                     if anti_spam_config.get("deletar_mensagens", True):
                         await deletar_mensagens_spam(message.author, message.channel, quantidade)
                     
-                    # Remove XP
                     xp_removido = False
                     if anti_spam_config.get("remover_xp", True):
                         xp_removido = await remover_xp_por_spam(message.author)
                     
-                    # Notifica o usuário
                     xp_msg = f" e teve **{anti_spam_config.get('xp_penalidade', 50)} XP removido**" if xp_removido else ""
                     try:
-                        await message.author.send(f"⚠️ **Você foi mutado por {duracao} minutos** devido a spam no servidor {message.guild.name}!{xp_msg}\nPor favor, evite enviar muitas mensagens repetidas em um curto período.\n\n💡 **Comandos da Mudae NÃO contam como spam e NÃO ganham XP!**")
+                        await message.author.send(f"⚠️ **Você foi mutado por {duracao} minutos** devido a spam no servidor {message.guild.name}!{xp_msg}\nPor favor, evite enviar muitas mensagens repetidas em um curto período.\n")
                     except:
                         await message.channel.send(f"⚠️ {message.author.mention}, você foi mutado por **{duracao} minutos** por spam!{xp_msg}")
                     
-                    # Registra no log
                     adicionar_log(f"anti_spam: {message.author.name} mutado por {duracao} min | {quantidade} msgs em {anti_spam_config.get('intervalo_segundos', 5)}s | XP removido: {xp_removido}")
                 
-                # Não processa a mensagem que causou o mute
                 return
     
-    # ========================
-    # Verificar bloqueio de links
-    # ========================
     canais_bloqueados = dados.get("canais_links_bloqueados", [])
     if message.channel.id in canais_bloqueados:
         url_pattern = r"https?://[^\s]+"
@@ -2724,9 +2776,6 @@ async def on_message(message: discord.Message):
                     pass
                 return
     
-    # ========================
-    # Sistema de XP (apenas para mensagens que NÃO são comandos ignorados)
-    # ========================
     dados.setdefault("xp", {})
     dados.setdefault("nivel", {})
     
