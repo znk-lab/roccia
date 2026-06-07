@@ -22,8 +22,8 @@ from PIL import Image, ImageDraw, ImageFont
 # ========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_USER = os.getenv("GITHUB_USER", "znk-lab")
-GITHUB_REPO = os.getenv("GITHUB_REPO", "roccia")
+GITHUB_USER = os.getenv("GITHUB_USER", "pobonsanto-byte")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "imune-bot-data")
 DATA_FILE = os.getenv("DATA_FILE", "data.json")
 BRANCH = os.getenv("GITHUB_BRANCH", "main")
 PORT = int(os.getenv("PORT", 8080))
@@ -2414,13 +2414,12 @@ async def slash_perfil(interaction: discord.Interaction, membro: discord.Member 
     largura, altura = 900, 200
     img = Image.new("RGBA", (largura, altura), (0, 0, 0, 255))
     draw = ImageDraw.Draw(img)
+
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     
-    try:
-        font_b = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 32)
-        font_s = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)
-    except:
-        font_b = ImageFont.load_default()
-        font_s = ImageFont.load_default()
+    font_b = ImageFont.truetype(os.path.join(BASE_DIR, "DejaVuSans-Bold.ttf"),32)
+    
+    font_s = ImageFont.truetype(os.path.join(BASE_DIR, "DejaVuSans.ttf"),22)
     
     try:
         avatar_bytes = await alvo.avatar.read()
