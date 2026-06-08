@@ -22,8 +22,8 @@ from PIL import Image, ImageDraw, ImageFont
 # ========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_USER = os.getenv("GITHUB_USER", "znk-lab")
-GITHUB_REPO = os.getenv("GITHUB_REPO", "roccia")
+GITHUB_USER = os.getenv("GITHUB_USER", "pobonsanto-byte")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "imune-bot-data")
 DATA_FILE = os.getenv("DATA_FILE", "data.json")
 BRANCH = os.getenv("GITHUB_BRANCH", "main")
 PORT = int(os.getenv("PORT", 8080))
@@ -92,9 +92,9 @@ dados = {
     "cargos_nivel": {},
     "canais_links_bloqueados": [],
     "botoes_cargos": {},
-    "links_fila": {  # NOVO: links para o site da fila
+    "links_fila": {
         "discord_convite": "",
-        "tabela_precos": ""
+        "botoes_precos": []  # NOVO: lista de botões personalizados
     },
     "anti_spam": {
         "ativado": True,
@@ -151,7 +151,7 @@ def carregar_dados_github():
                 if "canais_links_bloqueados" not in dados:
                     dados["canais_links_bloqueados"] = []
                 if "links_fila" not in dados:
-                    dados["links_fila"] = {"discord_convite": "", "tabela_precos": ""}
+                    dados["links_fila"] = {"discord_convite": "", "botoes_precos": []}
                 if "anti_spam" not in dados:
                     dados["anti_spam"] = {
                         "ativado": True,
@@ -179,6 +179,8 @@ def carregar_dados_github():
                         "canal_perfil": None,
                         "canal_rank": None
                     }
+                if "botoes_precos" not in dados.get("links_fila", {}):
+                    dados["links_fila"]["botoes_precos"] = []
                 print("✅ Dados carregados do GitHub.")
                 return True
         else:
@@ -395,7 +397,7 @@ def adicionar_fila(nome_usuario: str, servico: str, jogo: str = "", usuario_id: 
         "id": str(int(datetime.now().timestamp() * 1000)),
         "nome_usuario": nome_usuario,
         "servico": servico,
-        "jogo": jogo,  # NOVO: campo para o jogo
+        "jogo": jogo,
         "usuario_id": usuario_id or nome_usuario,
         "timestamp": agora_br().isoformat(),
         "status": "aguardando",
@@ -498,18 +500,38 @@ def definir_nome_fila(nome: str):
     return fila["nome"]
 
 # ========================
-# FUNÇÕES PARA LINKS DA FILA
+# FUNÇÕES PARA LINKS DA FILA (MÚLTIPLOS BOTÕES)
 # ========================
 def obter_links_fila():
-    dados.setdefault("links_fila", {"discord_convite": "", "tabela_precos": ""})
+    dados.setdefault("links_fila", {"discord_convite": "", "botoes_precos": []})
     return dados["links_fila"]
 
-def salvar_links_fila(discord_convite: str, tabela_precos: str):
-    dados["links_fila"] = {
-        "discord_convite": discord_convite or "",
-        "tabela_precos": tabela_precos or ""
-    }
+def salvar_links_fila(discord_convite: str):
+    dados["links_fila"]["discord_convite"] = discord_convite or ""
     return salvar_dados_github("Links da fila atualizados")
+
+def adicionar_botao_preco(nome: str, url: str):
+    if not nome or not url:
+        return False
+    dados["links_fila"].setdefault("botoes_precos", [])
+    dados["links_fila"]["botoes_precos"].append({"nome": nome[:30], "url": url[:500]})
+    return salvar_dados_github(f"Botão de preço adicionado: {nome}")
+
+def remover_botao_preco(index: int):
+    botoes = dados["links_fila"].get("botoes_precos", [])
+    if 0 <= index < len(botoes):
+        removido = botoes.pop(index)
+        salvar_dados_github(f"Botão de preço removido: {removido['nome']}")
+        return True
+    return False
+
+def atualizar_botao_preco(index: int, nome: str, url: str):
+    botoes = dados["links_fila"].get("botoes_precos", [])
+    if 0 <= index < len(botoes):
+        botoes[index] = {"nome": nome[:30], "url": url[:500]}
+        salvar_dados_github(f"Botão de preço atualizado: {nome}")
+        return True
+    return False
 
 # ========================
 # SISTEMA DE AÇÕES DO SITE
@@ -1011,6 +1033,12 @@ def logout():
 def fila_publica():
     fila = obter_dados_fila()
     links = obter_links_fila()
+    botoes_precos = links.get("botoes_precos", [])
+    
+    botoes_html = ""
+    for botao in botoes_precos:
+        botoes_html += f'<a href="{escape_html(botao["url"])}" target="_blank" class="btn-link btn-link-precos">💰 {escape_html(botao["nome"])}</a>'
+    
     return f'''
     <!DOCTYPE html>
     <html>
@@ -1053,7 +1081,7 @@ def fila_publica():
             
             <div class="links-container">
                 {'<a href="' + escape_html(links["discord_convite"]) + '" target="_blank" class="btn-link btn-link-discord">💬 Entrar no Discord</a>' if links.get("discord_convite") else ''}
-                {'<a href="' + escape_html(links["tabela_precos"]) + '" target="_blank" class="btn-link btn-link-precos">💰 Ver Preços</a>' if links.get("tabela_precos") else ''}
+                {botoes_html}
             </div>
             
             <div class="lista-fila">
@@ -1160,9 +1188,53 @@ def api_fila_configuracoes():
         definir_tamanho_maximo(int(req["tamanho_maximo"]))
     if "nome" in req:
         definir_nome_fila(req["nome"])
-    if "discord_convite" in req or "tabela_precos" in req:
-        salvar_links_fila(req.get("discord_convite", ""), req.get("tabela_precos", ""))
+    if "discord_convite" in req:
+        salvar_links_fila(req.get("discord_convite", ""))
     return jsonify({"sucesso": True})
+
+# ========================
+# APIs DOS BOTÕES DE PREÇO
+# ========================
+
+@app.route("/api/fila/botoes", methods=["GET"])
+def api_fila_botoes():
+    links = obter_links_fila()
+    return jsonify({"sucesso": True, "botoes": links.get("botoes_precos", [])})
+
+@app.route("/api/fila/botoes/adicionar", methods=["POST"])
+def api_fila_botoes_adicionar():
+    if 'usuario' not in session:
+        return jsonify({"sucesso": False}), 401
+    req = request.json
+    nome = req.get("nome", "").strip()
+    url = req.get("url", "").strip()
+    if not nome or not url:
+        return jsonify({"sucesso": False, "mensagem": "Nome e URL são obrigatórios"})
+    adicionar_botao_preco(nome, url)
+    return jsonify({"sucesso": True, "mensagem": f"Botão '{nome}' adicionado!"})
+
+@app.route("/api/fila/botoes/remover", methods=["POST"])
+def api_fila_botoes_remover():
+    if 'usuario' not in session:
+        return jsonify({"sucesso": False}), 401
+    index = request.json.get("index")
+    if index is None:
+        return jsonify({"sucesso": False, "mensagem": "Índice não informado"})
+    remover_botao_preco(int(index))
+    return jsonify({"sucesso": True, "mensagem": "Botão removido!"})
+
+@app.route("/api/fila/botoes/atualizar", methods=["POST"])
+def api_fila_botoes_atualizar():
+    if 'usuario' not in session:
+        return jsonify({"sucesso": False}), 401
+    req = request.json
+    index = req.get("index")
+    nome = req.get("nome", "").strip()
+    url = req.get("url", "").strip()
+    if index is None or not nome or not url:
+        return jsonify({"sucesso": False, "mensagem": "Dados incompletos"})
+    atualizar_botao_preco(int(index), nome, url)
+    return jsonify({"sucesso": True, "mensagem": "Botão atualizado!"})
 
 # ========================
 # APIs DE CONFIGURAÇÃO
@@ -1370,6 +1442,9 @@ def dashboard():
     fila = obter_dados_fila()
     anti_spam = dados.get("anti_spam", {})
     links = obter_links_fila()
+    botoes_precos = links.get("botoes_precos", [])
+    
+    botoes_precos_json = json.dumps(botoes_precos)
     
     return f'''
     <!DOCTYPE html>
@@ -1393,6 +1468,7 @@ def dashboard():
             .btn-success {{ background: var(--success); color: white; }}
             .btn-danger {{ background: var(--danger); color: white; }}
             .btn-warning {{ background: var(--warning); color: white; }}
+            .btn-sm {{ padding: 0.25rem 0.5rem; font-size: 0.8rem; }}
             .container {{ max-width: 1400px; margin: 2rem auto; padding: 0 1rem; }}
             .tab-nav {{ display: flex; gap: 0.5rem; margin-bottom: 1rem; border-bottom: 2px solid var(--gray); flex-wrap: wrap; }}
             .tab-btn {{ padding: 0.75rem 1.5rem; background: var(--gray); border: none; border-radius: 5px 5px 0 0; cursor: pointer; font-weight: 600; color: var(--light); }}
@@ -1427,6 +1503,12 @@ def dashboard():
             .info-box {{ background: #1a1a2e; border-left: 4px solid #5865F2; padding: 1rem; margin: 1rem 0; border-radius: 5px; }}
             .config-badge {{ display: inline-block; background: #2196F3; color: white; padding: 2px 8px; border-radius: 10px; font-size: 11px; margin-left: 5px; }}
             .config-removed {{ background: #f44336; }}
+            .botoes-lista {{ display: flex; flex-direction: column; gap: 10px; margin-top: 15px; }}
+            .botao-item {{ background: #1a1a1a; padding: 10px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }}
+            .botao-info {{ flex: 1; }}
+            .botao-nome {{ font-weight: bold; color: #f59e0b; }}
+            .botao-url {{ font-size: 12px; color: #888; word-break: break-all; }}
+            .botao-acoes {{ display: flex; gap: 8px; }}
         </style>
     </head>
     <body>
@@ -1725,7 +1807,7 @@ def dashboard():
                 </div>
             </div>
             
-            <!-- Aba Fila -->
+            <!-- Aba Fila (COM MÚLTIPLOS BOTÕES) -->
             <div id="fila" class="tab">
                 <div class="card">
                     <h2>📋 Configurações da Fila</h2>
@@ -1734,20 +1816,33 @@ def dashboard():
                         <div><label>Tamanho Máximo</label><input type="number" id="fila-max" class="form-control" value="{fila['configuracoes']['tamanho_maximo']}" min="1" max="100"></div>
                     </div>
                     
-                    <h3 style="margin-top: 20px;">🔗 Links do Site da Fila</h3>
-                    <div class="grid-2">
-                        <div class="form-group">
-                            <label>Link do Discord (convite)</label>
-                            <input type="url" id="link-discord" class="form-control" placeholder="https://discord.gg/seuconvite" value="{escape_html(links.get('discord_convite', ''))}">
-                        </div>
-                        <div class="form-group">
-                            <label>Link da Tabela de Preços</label>
-                            <input type="url" id="link-precos" class="form-control" placeholder="https://seusite.com/precos" value="{escape_html(links.get('tabela_precos', ''))}">
-                        </div>
+                    <h3 style="margin-top: 20px;">🔗 Links do Discord (convite)</h3>
+                    <div class="form-group">
+                        <label>Link do Discord (convite)</label>
+                        <input type="url" id="link-discord" class="form-control" placeholder="https://discord.gg/seuconvite" value="{escape_html(links.get('discord_convite', ''))}">
+                    </div>
+                    
+                    <h3 style="margin-top: 20px;">💰 Botões de Preço (Múltiplos)</h3>
+                    <div class="info-box">
+                        💡 <strong>Adicione quantos botões quiser!</strong> Cada botão terá um nome personalizado e um link diferente.
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Novo Botão - Nome</label>
+                        <input type="text" id="novo-botao-nome" class="form-control" placeholder="Ex: Tabela de Preços, Preços WuWa, Preços Mongil">
+                    </div>
+                    <div class="form-group">
+                        <label>Novo Botão - URL</label>
+                        <input type="url" id="novo-botao-url" class="form-control" placeholder="https://docs.google.com/...">
+                    </div>
+                    <button onclick="adicionarBotaoPreco()" class="btn btn-success">➕ Adicionar Botão</button>
+                    
+                    <div id="botoes-precos-lista" class="botoes-lista" style="margin-top: 20px;">
+                        <!-- Lista de botões será carregada aqui -->
                     </div>
                     
                     <div style="display: flex; gap: 1rem; margin-top: 1rem;">
-                        <button onclick="salvarConfigFila()" class="btn btn-primary">💾 Salvar</button>
+                        <button onclick="salvarConfigFila()" class="btn btn-primary">💾 Salvar Configurações</button>
                         <button onclick="alternarStatusFila()" id="toggle-fila-btn" class="btn {'btn-success' if fila['configuracoes']['aberta'] else 'btn-danger'}">{'🔓 Fechar Fila' if fila['configuracoes']['aberta'] else '🔒 Abrir Fila'}</button>
                         <button onclick="limparFila()" class="btn btn-danger">🗑️ Limpar Fila</button>
                     </div>
@@ -1773,7 +1868,7 @@ def dashboard():
                                 <tr><th>#</th><th>Jogador</th><th>Serviço</th><th>Jogo</th><th>Entrada</th><th>Ações</th></tr>
                             </thead>
                             <tbody id="fila-tabela"><tr><td colspan="6">Carregando...</td></tr></tbody>
-                         </table>
+                          </table>
                     </div>
                     <div style="margin-top: 10px;"><button onclick="atualizarFila()" class="btn btn-primary">🔄 Atualizar</button></div>
                 </div>
@@ -1818,6 +1913,7 @@ def dashboard():
             let cargos = [];
             let membros = [];
             let configAtual = {{}};
+            let botoesPrecos = {botoes_precos_json};
             
             async function carregarDados() {{
                 try {{
@@ -1905,12 +2001,126 @@ def dashboard():
                     
                     if (filaConfig.sucesso && filaConfig.links) {{
                         document.getElementById('link-discord').value = filaConfig.links.discord_convite || '';
-                        document.getElementById('link-precos').value = filaConfig.links.tabela_precos || '';
+                        if (filaConfig.links.botoes_precos) {{
+                            botoesPrecos = filaConfig.links.botoes_precos;
+                        }}
                     }}
                     
                     carregarCargosNivel();
                     carregarFila();
+                    carregarBotoesPrecos();
                 }} catch(e) {{ console.error(e); }}
+            }}
+            
+            function carregarBotoesPrecos() {{
+                const container = document.getElementById('botoes-precos-lista');
+                if (!container) return;
+                
+                if (botoesPrecos.length === 0) {{
+                    container.innerHTML = '<div style="text-align:center;padding:20px;color:#888;">Nenhum botão de preço configurado. Adicione um acima!</div>';
+                    return;
+                }}
+                
+                let html = '';
+                botoesPrecos.forEach((botao, index) => {{
+                    html += `
+                        <div class="botao-item">
+                            <div class="botao-info">
+                                <div class="botao-nome">💰 ${{escapeHtml(botao.nome)}}</div>
+                                <div class="botao-url">${{escapeHtml(botao.url)}}</div>
+                            </div>
+                            <div class="botao-acoes">
+                                <button onclick="editarBotaoPreco(${{index}})" class="btn btn-primary btn-sm">✏️ Editar</button>
+                                <button onclick="removerBotaoPreco(${{index}})" class="btn btn-danger btn-sm">🗑️ Remover</button>
+                            </div>
+                        </div>
+                    `;
+                }});
+                container.innerHTML = html;
+            }}
+            
+            async function adicionarBotaoPreco() {{
+                const nome = document.getElementById('novo-botao-nome').value.trim();
+                const url = document.getElementById('novo-botao-url').value.trim();
+                
+                if (!nome || !url) {{
+                    showAlert('fila-status', 'Preencha nome e URL do botão', false);
+                    return;
+                }}
+                
+                try {{
+                    const resp = await fetch('/api/fila/botoes/adicionar', {{
+                        method: 'POST',
+                        headers: {{'Content-Type': 'application/json'}},
+                        body: JSON.stringify({{nome, url}})
+                    }});
+                    const result = await resp.json();
+                    if (result.sucesso) {{
+                        document.getElementById('novo-botao-nome').value = '';
+                        document.getElementById('novo-botao-url').value = '';
+                        await carregarBotoesNovamente();
+                        showAlert('fila-status', result.mensagem, true);
+                    }} else {{
+                        showAlert('fila-status', result.mensagem, false);
+                    }}
+                }} catch(e) {{
+                    showAlert('fila-status', 'Erro: ' + e.message, false);
+                }}
+            }}
+            
+            async function carregarBotoesNovamente() {{
+                try {{
+                    const resp = await fetch('/api/fila/botoes');
+                    const data = await resp.json();
+                    if (data.sucesso) {{
+                        botoesPrecos = data.botoes;
+                        carregarBotoesPrecos();
+                    }}
+                }} catch(e) {{
+                    console.error(e);
+                }}
+            }}
+            
+            async function removerBotaoPreco(index) {{
+                if (!confirm('Remover este botão?')) return;
+                try {{
+                    const resp = await fetch('/api/fila/botoes/remover', {{
+                        method: 'POST',
+                        headers: {{'Content-Type': 'application/json'}},
+                        body: JSON.stringify({{index}})
+                    }});
+                    const result = await resp.json();
+                    if (result.sucesso) {{
+                        await carregarBotoesNovamente();
+                        showAlert('fila-status', result.mensagem, true);
+                    }} else {{
+                        showAlert('fila-status', result.mensagem, false);
+                    }}
+                }} catch(e) {{
+                    showAlert('fila-status', 'Erro: ' + e.message, false);
+                }}
+            }}
+            
+            function editarBotaoPreco(index) {{
+                const botao = botoesPrecos[index];
+                const novoNome = prompt('Digite o novo nome do botão:', botao.nome);
+                if (!novoNome) return;
+                const novaUrl = prompt('Digite a nova URL:', botao.url);
+                if (!novaUrl) return;
+                
+                fetch('/api/fila/botoes/atualizar', {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify({{index, nome: novoNome, url: novaUrl}})
+                }}).then(async (resp) => {{
+                    const result = await resp.json();
+                    if (result.sucesso) {{
+                        await carregarBotoesNovamente();
+                        showAlert('fila-status', result.mensagem, true);
+                    }} else {{
+                        showAlert('fila-status', result.mensagem, false);
+                    }}
+                }}).catch(e => showAlert('fila-status', 'Erro: ' + e.message, false));
             }}
             
             function atualizarStatusPerfil(canalId) {{
@@ -2278,12 +2488,12 @@ def dashboard():
                                     <td style="color:#ffb347;">${{escapeHtml(e.jogo || '')}}</td>
                                     <td>${{new Date(e.timestamp).toLocaleTimeString()}}</td>
                                     <td>
-                                        <button onclick="moverCima('${{e.id}}')" class="btn btn-primary" style="padding:4px 8px;">⬆️</button>
-                                        <button onclick="moverBaixo('${{e.id}}')" class="btn btn-primary" style="padding:4px 8px;">⬇️</button>
-                                        <button onclick="concluir('${{e.id}}')" class="btn btn-success" style="padding:4px 8px;">✅</button>
-                                        <button onclick="remover('${{e.id}}')" class="btn btn-danger" style="padding:4px 8px;">❌</button>
+                                        <button onclick="moverCima('${{e.id}}')" class="btn btn-primary btn-sm">⬆️</button>
+                                        <button onclick="moverBaixo('${{e.id}}')" class="btn btn-primary btn-sm">⬇️</button>
+                                        <button onclick="concluir('${{e.id}}')" class="btn btn-success btn-sm">✅</button>
+                                        <button onclick="remover('${{e.id}}')" class="btn btn-danger btn-sm">❌</button>
                                     </td>
-                                </td>
+                                </table>
                             `).join('');
                         }}
                         const filaStatus = document.getElementById('fila-status');
@@ -2329,8 +2539,7 @@ def dashboard():
                 const data = {{
                     nome: document.getElementById('fila-nome').value,
                     tamanho_maximo: parseInt(document.getElementById('fila-max').value),
-                    discord_convite: document.getElementById('link-discord').value,
-                    tabela_precos: document.getElementById('link-precos').value
+                    discord_convite: document.getElementById('link-discord').value
                 }};
                 await fetch('/api/fila/configuracoes', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(data)}});
                 carregarFila();
@@ -2599,8 +2808,9 @@ async def on_ready():
     print(f"🚫 Comandos da Mudae: NÃO ganham XP e NÃO contam como spam")
     print(f"📢 Canal do /perfil: {config.get('canal_perfil') or 'TODOS OS CANAIS'}")
     print(f"📢 Canal do /rank: {config.get('canal_rank') or 'TODOS OS CANAIS'}")
-    if links.get('discord_convite') or links.get('tabela_precos'):
-        print(f"🔗 Links da fila configurados")
+    botoes_qtd = len(links.get("botoes_precos", []))
+    if links.get('discord_convite') or botoes_qtd > 0:
+        print(f"🔗 Links da fila configurados: {botoes_qtd} botão(ões) de preço")
     print(f"💡 Dica: Selecione o mesmo canal duas vezes no painel para remover a restrição!")
     print(f"{'='*50}\n")
 
