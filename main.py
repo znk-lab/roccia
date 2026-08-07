@@ -24,8 +24,8 @@ import uuid
 # ========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_USER = os.getenv("GITHUB_USER", "pobonsanto-byte")
-GITHUB_REPO = os.getenv("GITHUB_REPO", "imune-bot-data")
+GITHUB_USER = os.getenv("GITHUB_USER", "znk-lab")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "roccia")
 DATA_FILE = os.getenv("DATA_FILE", "data.json")
 BRANCH = os.getenv("GITHUB_BRANCH", "main")
 PORT = int(os.getenv("PORT", 8080))
@@ -1212,7 +1212,7 @@ def pagina_fidelidade():
     </head>
     <body>
         <div class="container">
-            <center><h1>Services & Pontos ZankonYTB</h1></center>
+            <center><h1>Services & Pontos Zankon</h1></center>
 
             <div id="msg-alert" class="alert"></div>
 
@@ -1285,7 +1285,7 @@ def pagina_fidelidade():
             {% endif %}
 
             <div class="card rules">
-                <h3>📌 Regras de Uso - Sistema de Fidelidade ZankonYTB</h3>
+                <h3>📌 Regras de Uso - Sistema de Fidelidade Zankon</h3>
                 <ul>
                     <li><strong>Pontos Pessoais:</strong> Atrelados diretamente ao seu UID. Não podem ser transferidos entre contas.</li>
                     <li><strong>Cupons de Uso Único:</strong> Cada cupom gerado possui um token exclusivo que é queimado ao ser utilizado em um pedido.</li>
