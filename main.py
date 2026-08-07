@@ -5,12 +5,13 @@ import re
 import requests
 import time
 import secrets
+import hashlib
 from io import BytesIO
 from threading import Thread
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 import asyncio
-from flask import Flask, render_template, request, redirect, url_for, session, jsonify
+from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -23,8 +24,8 @@ import uuid
 # ========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_USER = os.getenv("GITHUB_USER", "znk-lab")
-GITHUB_REPO = os.getenv("GITHUB_REPO", "roccia")
+GITHUB_USER = os.getenv("GITHUB_USER", "pobonsanto-byte")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "imune-bot-data")
 DATA_FILE = os.getenv("DATA_FILE", "data.json")
 BRANCH = os.getenv("GITHUB_BRANCH", "main")
 PORT = int(os.getenv("PORT", 8080))
@@ -81,7 +82,8 @@ dados = {
         "canal_levelup": None,
         "canal_logs": None,
         "canal_perfil": None,
-        "canal_rank": None
+        "canal_rank": None,
+        "pix_link": ""
     },
     "logs": [],
     "fila": {
@@ -164,18 +166,17 @@ dados = {
             "tipo": "cupom",
             "desconto": 20.0
         }
-    ]
+    ],
+    "credenciais": {}  # { "uid": { "hash": "sha256(salt+senha)", "salt": "..." } }
 }
 
-# Dicionário para armazenar mensagens recentes dos usuários
-mensagens_recentes = {}  # {user_id: [timestamps]}
+mensagens_recentes = {}
 
 # ==========================================
 # CONFIGURAÇÃO DO SISTEMA DE FIDELIDADE (dinâmico)
 # ==========================================
 
 def obter_recompensas():
-    """Retorna a lista de recompensas do JSON, garantindo existência"""
     if "recompensas_fidelidade" not in dados:
         dados["recompensas_fidelidade"] = []
     return dados["recompensas_fidelidade"]
@@ -190,7 +191,6 @@ def obter_recompensa_por_id(recompensa_id: str):
 
 
 def obter_ou_criar_perfil_fidelidade(uid: str):
-    """Garante a estrutura no JSON 'dados' para o UID informado e verifica expirações"""
     dados.setdefault("fidelidade", {})
     uid_str = str(uid).strip()
 
@@ -205,18 +205,38 @@ def obter_ou_criar_perfil_fidelidade(uid: str):
     perfil = dados["fidelidade"][uid_str]
     agora = time.time()
 
-    # 🕒 REGRA 1: Expiração de Pontos por Inatividade (90 Dias)
     if perfil["pontos"] > 0 and (agora - perfil.get("ultimo_pedido_ts", agora)) > (60 * 86400):
         perfil["pontos"] = 0
         perfil["pontos_expirados"] = True
 
-    # 🕒 REGRA 2: Validade dos Cupons Resgatados (30 Dias)
     for cupom in perfil.get("cupons", []):
         if not cupom.get("usado", False) and not cupom.get("expirado", False):
             if (agora - cupom.get("criado_em_ts", agora)) > (30 * 86400):
                 cupom["expirado"] = True
 
     return perfil
+
+
+# ========================
+# FUNÇÕES DE HASH DE SENHA
+# ========================
+def hash_senha(senha: str) -> dict:
+    salt = secrets.token_hex(16)
+    hash_obj = hashlib.sha256((salt + senha).encode()).hexdigest()
+    return {"salt": salt, "hash": hash_obj}
+
+
+def verificar_senha(senha: str, cred: dict) -> bool:
+    if not cred:
+        return False
+    hash_calculado = hashlib.sha256((cred["salt"] + senha).encode()).hexdigest()
+    return hash_calculado == cred["hash"]
+
+
+def validar_senha(senha: str) -> bool:
+    # Mínimo 8 caracteres, pelo menos uma minúscula, uma maiúscula, um número e um caractere especial
+    padrao = r'^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^a-zA-Z0-9]).{8,}$'
+    return re.match(padrao, senha) is not None
 
 
 # ========================
@@ -281,7 +301,8 @@ def carregar_dados_github():
                         "canal_levelup": None,
                         "canal_logs": None,
                         "canal_perfil": None,
-                        "canal_rank": None
+                        "canal_rank": None,
+                        "pix_link": ""
                     }
                 if "botoes_precos" not in dados.get("links_fila", {}):
                     dados["links_fila"]["botoes_precos"] = []
@@ -299,6 +320,8 @@ def carregar_dados_github():
                          "tipo": "servico", "desconto": 0},
                         {"id": "cupom_20", "nome": "Cupom de R$ 20,00", "pontos": 400, "tipo": "cupom", "desconto": 20.0}
                     ]
+                if "credenciais" not in dados:
+                    dados["credenciais"] = {}
                 print("✅ Dados carregados do GitHub.")
                 return True
         else:
@@ -370,21 +393,17 @@ def escape_html(texto):
 # ========================
 
 def verificar_comando_ignorado(conteudo: str) -> bool:
-    """Verifica se a mensagem é um comando ignorado (não conta como spam e NÃO ganha XP)"""
     conteudo_lower = conteudo.lower().strip()
     comandos_ignorados = dados.get("anti_spam", {}).get("comandos_ignorados", [])
-
     for comando in comandos_ignorados:
         if conteudo_lower.startswith(comando.lower()):
             return True
         if conteudo_lower == comando.lower():
             return True
-
     return False
 
 
 def verificar_cargo_ignorado(member: discord.Member) -> bool:
-    """Verifica se o membro tem cargo que ignora o anti-spam"""
     cargos_ignorados = dados.get("anti_spam", {}).get("cargos_ignorados", [])
     cargos_membro = [role.name for role in member.roles]
     for cargo_ignorado in cargos_ignorados:
@@ -394,40 +413,30 @@ def verificar_cargo_ignorado(member: discord.Member) -> bool:
 
 
 def limpar_mensagens_antigas(user_id: int):
-    """Remove mensagens mais antigas que o intervalo configurado"""
     if user_id not in mensagens_recentes:
         return
-
     intervalo = dados.get("anti_spam", {}).get("intervalo_segundos", 5)
     agora = time.time()
     mensagens_recentes[user_id] = [
         ts for ts in mensagens_recentes[user_id]
         if agora - ts < intervalo
     ]
-
     if not mensagens_recentes[user_id]:
         del mensagens_recentes[user_id]
 
 
 def registrar_mensagem(user_id: int) -> int:
-    """Registra uma mensagem e retorna quantas mensagens o usuário enviou no intervalo"""
     agora = time.time()
-
     if user_id not in mensagens_recentes:
         mensagens_recentes[user_id] = []
-
     mensagens_recentes[user_id].append(agora)
     limpar_mensagens_antigas(user_id)
-
     return len(mensagens_recentes.get(user_id, []))
 
 
 async def aplicar_mute(member: discord.Member, duracao_minutos: int = 2):
-    """Aplica mute temporário no membro"""
     guild = member.guild
-
     mute_role = discord.utils.get(guild.roles, name="Muted")
-
     if not mute_role:
         try:
             mute_role = await guild.create_role(name="Muted", permissions=discord.Permissions.none())
@@ -443,14 +452,12 @@ async def aplicar_mute(member: discord.Member, duracao_minutos: int = 2):
 
     try:
         await member.add_roles(mute_role, reason=f"Anti-spam: {duracao_minutos} minutos de mute")
-
         async def remover_mute():
             await asyncio.sleep(duracao_minutos * 60)
             try:
                 await member.remove_roles(mute_role, reason="Fim do mute por spam")
             except:
                 pass
-
         asyncio.create_task(remover_mute())
         return True
     except Exception as e:
@@ -459,10 +466,8 @@ async def aplicar_mute(member: discord.Member, duracao_minutos: int = 2):
 
 
 async def deletar_mensagens_spam(member: discord.Member, channel: discord.TextChannel, quantidade: int):
-    """Deleta as mensagens de spam do usuário"""
     if not dados.get("anti_spam", {}).get("deletar_mensagens", True):
         return
-
     try:
         async for msg in channel.history(limit=quantidade + 5):
             if msg.author == member:
@@ -476,22 +481,16 @@ async def deletar_mensagens_spam(member: discord.Member, channel: discord.TextCh
 
 
 async def remover_xp_por_spam(member: discord.Member):
-    """Remove XP do usuário por spam"""
     if not dados.get("anti_spam", {}).get("remover_xp", True):
         return False
-
     uid = str(member.id)
     penalidade = dados.get("anti_spam", {}).get("xp_penalidade", 50)
     xp_atual = dados.get("xp", {}).get(uid, 0)
-
     novo_xp = max(0, xp_atual - penalidade)
     dados["xp"][uid] = novo_xp
-
     novo_nivel = xp_para_nivel(novo_xp)
     dados["nivel"][uid] = novo_nivel
-
     salvar_dados_github(f"Anti-spam: {penalidade} XP removido de {member.name}")
-
     return True
 
 
@@ -513,30 +512,26 @@ def salvar_fila():
     return salvar_dados_github("Atualização da fila")
 
 
-def adicionar_fila(nome_usuario: str, servico: str, jogo: str = "", usuario_id: str = None):
+def adicionar_fila(nome_usuario: str, servico: str, jogo: str = "", usuario_id: str = None, uid: str = None):
     fila = obter_dados_fila()
-
     if not fila["configuracoes"]["aberta"]:
         return False, "Fila está fechada no momento"
-
     if len(fila["entradas"]) >= fila["configuracoes"]["tamanho_maximo"]:
         return False, "Fila está cheia"
-
     for entrada in fila["entradas"]:
         if entrada["nome_usuario"].lower() == nome_usuario.lower():
             return False, f"{nome_usuario} já está na fila"
-
     entrada = {
         "id": str(int(datetime.now().timestamp() * 1000)),
         "nome_usuario": nome_usuario,
         "servico": servico,
         "jogo": jogo,
         "usuario_id": usuario_id or nome_usuario,
+        "uid": uid or "",  # não usar fallback para nome
         "timestamp": agora_br().isoformat(),
         "status": "aguardando",
         "posicao": len(fila["entradas"]) + 1
     }
-
     fila["entradas"].append(entrada)
     atualizar_posicoes(fila["entradas"])
     salvar_fila()
@@ -546,7 +541,6 @@ def adicionar_fila(nome_usuario: str, servico: str, jogo: str = "", usuario_id: 
 
 def remover_fila(entrada_id: str):
     fila = obter_dados_fila()
-
     for i, entrada in enumerate(fila["entradas"]):
         if entrada["id"] == entrada_id:
             removido = fila["entradas"].pop(i)
@@ -717,7 +711,6 @@ async def executar_acao_bot_interno(acao):
             canal = guild.get_channel(canal_id)
             if not canal:
                 return False
-
             cor = discord.Color.blue()
             if dados_acao.get('cor'):
                 try:
@@ -725,22 +718,18 @@ async def executar_acao_bot_interno(acao):
                     cor = discord.Color(int(cor_hex, 16))
                 except:
                     pass
-
             embed = discord.Embed(
                 title=dados_acao["titulo"],
                 description=dados_acao["corpo"],
                 color=cor
             )
-
             if dados_acao.get('url_imagem'):
                 embed.set_image(url=dados_acao['url_imagem'])
-
             texto_mencao = ""
             if dados_acao.get('mencao') == 'everyone':
                 texto_mencao = "@everyone"
             elif dados_acao.get('mencao') == 'here':
                 texto_mencao = "@here"
-
             await canal.send(content=texto_mencao, embed=embed)
             print(f"✅ Embed enviada para #{canal.name}")
             return True
@@ -750,7 +739,6 @@ async def executar_acao_bot_interno(acao):
             canal = guild.get_channel(canal_id)
             if not canal:
                 return False
-
             mensagem = await canal.send(dados_acao["conteudo"])
             mensagem_id = str(mensagem.id)
 
@@ -758,7 +746,6 @@ async def executar_acao_bot_interno(acao):
             pares = []
             par_atual = ""
             contador_chaves = 0
-
             for char in pares_str:
                 if char == '<':
                     contador_chaves += 1
@@ -850,7 +837,6 @@ async def executar_acao_bot_interno(acao):
             canal = guild.get_channel(canal_id)
             if not canal:
                 return False
-
             pares = dados_acao.get("cargos", "").split(",")
             dicionario_botoes = {}
             for par in pares:
@@ -862,7 +848,6 @@ async def executar_acao_bot_interno(acao):
                             dicionario_botoes[nome_botao.strip()] = cargo.id
                     except:
                         pass
-
             if dicionario_botoes:
                 class PersistentRoleButton(ui.Button):
                     def __init__(self, label: str, cargo_id: int, mensagem_id: int):
@@ -910,7 +895,6 @@ async def executar_acao_bot_interno(acao):
             membro = guild.get_member(membro_id)
             if not membro:
                 return False
-
             entrada = {
                 "por": "admin_site",
                 "motivo": dados_acao["motivo"],
@@ -950,7 +934,6 @@ async def executar_acao_bot_interno(acao):
                     config["canal_perfil"] = None
                 else:
                     config["canal_perfil"] = novo_canal_perfil if novo_canal_perfil else None
-
             if 'canal_rank' in dados_acao:
                 canal_rank_atual = config.get("canal_rank")
                 novo_canal_rank = dados_acao['canal_rank']
@@ -958,7 +941,6 @@ async def executar_acao_bot_interno(acao):
                     config["canal_rank"] = None
                 else:
                     config["canal_rank"] = novo_canal_rank if novo_canal_rank else None
-
             salvar_dados_github("Config canais de comandos atualizada")
             return True
 
@@ -1019,17 +1001,13 @@ async def executar_acao_bot_interno(acao):
 
 async def processar_acoes_bot_continuo():
     global processador_acoes_rodando
-
     print("\n" + "=" * 60)
     print("🚀 PROCESSADOR DE AÇÕES INICIADO")
     print("=" * 60)
-
     processador_acoes_rodando = True
-
     if not bot.is_ready():
         await bot.wait_until_ready()
         await asyncio.sleep(2)
-
     while processador_acoes_rodando and not bot.is_closed():
         try:
             if acoes_fila_bot:
@@ -1039,7 +1017,6 @@ async def processar_acoes_bot_continuo():
         except Exception as e:
             print(f"⚠️ Erro no processador: {e}")
             await asyncio.sleep(5)
-
     print("⏹️ PROCESSADOR DE AÇÕES ENCERRADO")
 
 
@@ -1064,8 +1041,7 @@ def iniciar_processador_acoes():
 def home():
     status_bot = "✅ Bot Online" if bot.is_ready() else "❌ Bot Offline"
     classe_bot = "online" if bot.is_ready() else "offline"
-
-    return f'''
+    return render_template_string("""
     <!DOCTYPE html>
     <html>
     <head>
@@ -1073,25 +1049,25 @@ def home():
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Painel de Controle</title>
         <style>
-            body {{ font-family: 'Segoe UI', sans-serif; background: linear-gradient(135deg, #0a0a0a, #1a1a1a); margin: 0; padding: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; color: #e0e0e0; }}
-            .container {{ background: #121212; border-radius: 20px; padding: 40px; text-align: center; max-width: 500px; width: 90%; border: 1px solid #333; }}
-            h1 {{ color: #5865F2; margin-bottom: 10px; }}
-            .status {{ padding: 10px; border-radius: 10px; margin: 20px 0; font-weight: bold; }}
-            .online {{ background: #1a472a; color: #4ade80; border: 1px solid #2ecc71; }}
-            .offline {{ background: #7f1d1d; color: #f87171; border: 1px solid #ef4444; }}
-            .btn {{ display: inline-block; background: #5865F2; color: white; padding: 12px 30px; border-radius: 8px; text-decoration: none; font-weight: bold; margin: 10px; transition: all 0.3s; }}
-            .btn:hover {{ background: #4752C4; transform: translateY(-2px); }}
-            .features {{ text-align: left; margin: 20px 0; padding: 15px; background: #1a1a1a; border-radius: 10px; border: 1px solid #333; }}
-            .features h3 {{ color: #5865F2; }}
-            .features li {{ margin: 8px 0; padding-left: 10px; list-style: none; }}
-            .features li:before {{ content: "✅"; margin-right: 10px; color: #5865F2; }}
-            code {{ background: #1a1a1a; padding: 2px 6px; border-radius: 4px; color: #4ade80; }}
+            body { font-family: 'Segoe UI', sans-serif; background: linear-gradient(135deg, #0a0a0a, #1a1a1a); margin: 0; padding: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; color: #e0e0e0; }
+            .container { background: #121212; border-radius: 20px; padding: 40px; text-align: center; max-width: 500px; width: 90%; border: 1px solid #333; }
+            h1 { color: #5865F2; margin-bottom: 10px; }
+            .status { padding: 10px; border-radius: 10px; margin: 20px 0; font-weight: bold; }
+            .online { background: #1a472a; color: #4ade80; border: 1px solid #2ecc71; }
+            .offline { background: #7f1d1d; color: #f87171; border: 1px solid #ef4444; }
+            .btn { display: inline-block; background: #5865F2; color: white; padding: 12px 30px; border-radius: 8px; text-decoration: none; font-weight: bold; margin: 10px; transition: all 0.3s; }
+            .btn:hover { background: #4752C4; transform: translateY(-2px); }
+            .features { text-align: left; margin: 20px 0; padding: 15px; background: #1a1a1a; border-radius: 10px; border: 1px solid #333; }
+            .features h3 { color: #5865F2; }
+            .features li { margin: 8px 0; padding-left: 10px; list-style: none; }
+            .features li:before { content: "✅"; margin-right: 10px; color: #5865F2; }
+            code { background: #1a1a1a; padding: 2px 6px; border-radius: 4px; color: #4ade80; }
         </style>
     </head>
     <body>
         <div class="container">
             <h1> Painel de Controle</h1>
-            <div class="status {classe_bot}">{status_bot}</div>
+            <div class="status {{ classe_bot }}">{{ status_bot }}</div>
             <div class="features">
                 <h3> Funcionalidades:</h3>
                 <ul>
@@ -1106,19 +1082,25 @@ def home():
                     <li>Comandos /perfil e /rank podem ser configurados para canais específicos</li>
                 </ul>
             </div>
-            {"<a href='/login' class='btn'>🔐 Login com Discord</a>" if 'usuario' not in session else f'<p>Olá, {session["usuario"]["nome_usuario"]}!</p><a href="/dashboard" class="btn">🚀 Painel</a><a href="/fila" class="btn">📋 Fila</a><a href="/logout" class="btn">🚪 Sair</a>'}
+            {% if 'usuario' not in session %}
+                <a href='/login' class='btn'>🔐 Login com Discord</a>
+            {% else %}
+                <p>Olá, {{ session['usuario']['nome_usuario'] }}!</p>
+                <a href="/dashboard" class="btn">🚀 Painel</a>
+                <a href="/fila" class="btn">📋 Fila</a>
+                <a href="/logout" class="btn">🚪 Sair</a>
+            {% endif %}
             <p style="margin-top: 20px; color: #888;">Use <code>/perfil</code> e <code>/rank</code> no Discord (apenas nos canais configurados)</p>
         </div>
     </body>
     </html>
-    '''
+    """, status_bot=status_bot, classe_bot=classe_bot, session=session)
 
 
 @app.route("/login")
 def login():
     if not CLIENT_ID or not CLIENT_SECRET:
         return "Erro: CLIENT_ID ou CLIENT_SECRET não configurados.", 500
-
     url = f"https://discord.com/api/oauth2/authorize?client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}&response_type=code&scope=identify%20guilds"
     return redirect(url)
 
@@ -1127,11 +1109,9 @@ def login():
 def callback():
     if not CLIENT_ID or not CLIENT_SECRET:
         return "Erro de configuração.", 500
-
     code = request.args.get('code')
     if not code:
         return "Erro: código não recebido", 400
-
     try:
         dados_req = {
             'client_id': CLIENT_ID,
@@ -1141,40 +1121,30 @@ def callback():
             'redirect_uri': REDIRECT_URI,
             'scope': 'identify guilds'
         }
-
         r = requests.post('https://discord.com/api/oauth2/token', data=dados_req)
         if r.status_code != 200:
             return f"Erro ao obter token: {r.text[:100]}", 400
-
         access_token = r.json()['access_token']
-
         user_r = requests.get('https://discord.com/api/users/@me', headers={'Authorization': f'Bearer {access_token}'})
         if user_r.status_code != 200:
             return "Erro ao obter informações", 400
-
         user_data = user_r.json()
-
         guilds_r = requests.get('https://discord.com/api/users/@me/guilds', headers={'Authorization': f'Bearer {access_token}'})
         guilds = guilds_r.json() if guilds_r.status_code == 200 else []
-
         is_admin = False
         for guild in guilds:
             if str(guild['id']) == GUILD_ID and (guild['permissions'] & 0x8):
                 is_admin = True
                 break
-
         if not is_admin:
             return "<h2>⚠️ Acesso Restrito</h2><p>Apenas administradores podem acessar.</p><a href='/'>Voltar</a>", 403
-
         session['usuario'] = {
             'id': user_data['id'],
             'nome_usuario': user_data['username'],
             'avatar': user_data.get('avatar'),
             'eh_admin': True
         }
-
         return redirect(url_for('dashboard'))
-
     except Exception as e:
         return f"Erro interno: {str(e)}", 500
 
@@ -1191,8 +1161,16 @@ def logout():
 
 @app.route("/pedido")
 def pagina_fidelidade():
-    """Página Pública para os membros consultarem pontos, solicitarem serviços e resgatarem prêmios"""
-    return '''
+    config = dados.get("config", {})
+    pix_link = config.get("pix_link", "")
+    pix_html = f'<a href="{pix_link}" target="_blank" class="btn-pix">💳 Pagar via PIX</a>' if pix_link else ''
+
+    # Verifica se o cliente está logado
+    cliente = session.get('cliente')
+    uid_logado = cliente.get('uid') if cliente else None
+    is_logado = bool(cliente)
+
+    return render_template_string("""
     <!DOCTYPE html>
     <html lang="pt-BR">
     <head>
@@ -1218,86 +1196,94 @@ def pagina_fidelidade():
             th, td { padding: 10px; border-bottom: 1px solid #333; text-align: left; }
             th { background: #252525; color: #00d2d3; }
             .rules { background: #1a252f; border-left: 4px solid #3498db; padding: 15px; font-size: 0.9rem; line-height: 1.5; }
+            .btn-pix { display: inline-block; background: #00b894; color: #000; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-weight: bold; margin: 10px 0; }
+            .btn-pix:hover { background: #00d2d3; }
+            .validade { color: #feca57; font-size: 0.9rem; margin-top: 5px; }
+            .login-box { max-width: 400px; margin: 20px auto; }
+            .login-box input { margin-bottom: 10px; }
+            .login-box .btn-login { background: #5865F2; }
+            .login-box .btn-login:hover { background: #4752C4; }
+            .btn-sair { background: #dc3545; }
+            .btn-sair:hover { background: #c82333; }
+            .btn-voltar { background: #6c757d; }
+            .btn-voltar:hover { background: #5a6268; }
+            .link-pedido { margin-top: 20px; display: inline-block; background: #00b894; color: #000; padding: 10px 20px; border-radius: 8px; text-decoration: none; font-weight: bold; }
         </style>
     </head>
     <body>
         <div class="container">
             <center><h1>Services & Pontos ZankonYTB</h1></center>
-            
+
             <div id="msg-alert" class="alert"></div>
 
-            <!-- Consulta por UID -->
+            {% if not is_logado %}
+            <!-- TELA DE LOGIN / CADASTRO -->
+            <div class="card login-box">
+                <h2>🔐 Acesso Cliente</h2>
+                <div id="login-status" style="color:#feca57; margin-bottom:10px;"></div>
+                <input type="text" id="login-uid" placeholder="Seu UID" style="margin-bottom:5px;">
+                <input type="password" id="login-senha" placeholder="Senha">
+                <button onclick="loginCliente()" class="btn-login">Entrar</button>
+                <hr style="border-color:#333;">
+                <h3>Novo cliente? Cadastre-se</h3>
+                <input type="text" id="cad-uid" placeholder="UID">
+                <input type="password" id="cad-senha" placeholder="Senha (mín 8 caracteres, com maiúscula, minúscula, número e caractere especial)">
+                <input type="password" id="cad-senha2" placeholder="Confirmar senha">
+                <button onclick="cadastrarCliente()">Cadastrar</button>
+                <div id="cad-msg" style="margin-top:10px; color:#aaa;"></div>
+            </div>
+            {% else %}
+            <!-- PAINEL DO CLIENTE LOGADO -->
             <div class="card">
-                <h2>Login</h2>
-                <label>Digite seu UID do Jogo:</label>
-                <div style="display:flex; gap: 10px;">
-                    <input type="text" id="cliente-uid" placeholder="Ex: 100234891" style="margin:0;">
-                    <button onclick="consultarPerfil()" style="width: 150px; margin:0;">Consultar</button>
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <h2>Bem-vindo, <span id="disp-uid" style="color:#00d2d3;">{{ uid_logado }}</span></h2>
+                    <button onclick="logoutCliente()" class="btn-sair" style="width:auto; padding:8px 16px;">🚪 Sair</button>
                 </div>
             </div>
 
-            <!-- Painel de Status do Cliente (Oculto até consultar) -->
-            <div id="painel-cliente" style="display: none;">
+            <div id="painel-cliente">
                 <div class="card">
                     <h2>Seu Saldo de Pontos</h2>
-                    <p>UID: <strong id="disp-uid" style="color:#00d2d3;">-</strong></p>
                     <div class="points-badge"><span id="disp-pontos">0</span> Pontos</div>
                     <p style="font-size:0.85rem; color:#aaa; margin-top:10px;">* R$ 1,00 gasto em serviços = 1 Ponto acumulado.</p>
+                    <div id="validade-pontos" class="validade"></div>
                 </div>
 
-                <!-- Resgate de Recompensas (dinâmico) -->
                 <div class="card">
                     <h2>Trocar Pontos por Vantagens</h2>
-                    <div id="recompensas-container" class="reward-grid">
-                        <!-- Carregado via JS -->
-                    </div>
-
+                    <div id="recompensas-container" class="reward-grid"></div>
                     <h3>Seus Cupons Resgatados Ativos</h3>
                     <div id="lista-cupons"><p>Nenhum cupom ativo no momento.</p></div>
                 </div>
 
-                <!-- Formulario de Solicitação de Serviço (com Jogo) -->
                 <div class="card">
                     <h2>Solicitar Novo Serviço</h2>
                     <label>Nome do Serviço Desejado:</label>
                     <input type="text" id="ped-servico" placeholder="Ex: Farm de eco, Quests, Exploração">
-
                     <label>Jogo:</label>
                     <input type="text" id="ped-jogo" placeholder="Ex: Wuthering Waves, Mongil">
-
                     <label>Valor Combinado (R$):</label>
                     <input type="number" id="ped-valor" step="0.00" placeholder="Ex: 25.00">
-
                     <label>Nick do Youtube ou Discord:</label>
                     <input type="text" id="ped-discord" placeholder="Ex: usuario_discord">
-
                     <label>Possui Cupom de Desconto? (Opcional):</label>
                     <input type="text" id="ped-cupom" placeholder="Insira seu Token ex: ZNK-XXXXXX">
-
                     <button onclick="enviarPedidoServico()">Enviar Pedido para Aprovação</button>
                 </div>
 
-                <!-- Histórico de Serviços Concluídos -->
+                <!-- BOTÃO PIX movido para cá (entre Solicitar Serviço e Histórico) -->
+                {{ pix_html|safe }}
+
                 <div class="card">
                     <h2>Seu Histórico de Pedidos</h2>
                     <table>
-                        <thead>
-                            <tr>
-                                <th>Data</th>
-                                <th>Serviço</th>
-                                <th>Jogo</th>
-                                <th>Valor</th>
-                                <th>Pontos Ganhos</th>
-                            </tr>
-                        </thead>
-                        <tbody id="lista-historico">
-                            <tr><td colspan="5">Nenhum serviço concluído ainda.</td></tr>
-                        </tbody>
+                        <thead><tr><th>Data</th><th>Serviço</th><th>Jogo</th><th>Valor</th><th>Pontos Ganhos</th></tr></thead>
+                        <tbody id="lista-historico"><tr><td colspan="5">Nenhum serviço concluído ainda.</td></tr></tbody>
                     </table>
                 </div>
             </div>
+            {% endif %}
 
-            <!-- Regras do Sistema -->
             <div class="card rules">
                 <h3>📌 Regras de Uso - Sistema de Fidelidade ZankonYTB</h3>
                 <ul>
@@ -1313,8 +1299,14 @@ def pagina_fidelidade():
         <script>
             let currentUID = '';
             let recompensas = [];
+            let isLoggedIn = {{ 'true' if is_logado else 'false' }};
 
-            // Carrega recompensas do servidor
+            // Se já estiver logado, carregar os dados
+            if (isLoggedIn) {
+                currentUID = '{{ uid_logado }}';
+                consultarPerfil();
+            }
+
             async function carregarRecompensas() {
                 try {
                     const resp = await fetch('/api/fidelidade/recompensas');
@@ -1348,20 +1340,20 @@ def pagina_fidelidade():
             }
 
             async function consultarPerfil() {
-                const uid = document.getElementById('cliente-uid').value.trim();
-                if (!uid) { alert('Digite seu UID!'); return; }
-                currentUID = uid;
-
+                if (!currentUID) return;
                 try {
-                    const resp = await fetch('/api/fidelidade/consultar?uid=' + encodeURIComponent(uid));
+                    const resp = await fetch('/api/fidelidade/consultar?uid=' + encodeURIComponent(currentUID));
                     const data = await resp.json();
-
                     if (data.sucesso) {
-                        document.getElementById('painel-cliente').style.display = 'block';
-                        document.getElementById('disp-uid').textContent = data.uid;
                         document.getElementById('disp-pontos').textContent = data.perfil.pontos;
-
-                        // Renderiza Cupons
+                        const validadeDiv = document.getElementById('validade-pontos');
+                        if (data.perfil.pontos > 0 && data.validade_pontos) {
+                            validadeDiv.innerHTML = `📅 Pontos válidos até: <strong>${data.validade_pontos}</strong> (60 dias de inatividade)`;
+                        } else if (data.perfil.pontos === 0) {
+                            validadeDiv.innerHTML = '⚠️ Você não possui pontos ativos.';
+                        } else {
+                            validadeDiv.innerHTML = '';
+                        }
                         const cuponsDiv = document.getElementById('lista-cupons');
                         if (data.perfil.cupons && data.perfil.cupons.length > 0) {
                             let html = '<ul>';
@@ -1375,8 +1367,6 @@ def pagina_fidelidade():
                         } else {
                             cuponsDiv.innerHTML = '<p>Nenhum cupom ativo no momento.</p>';
                         }
-
-                        // Renderiza Histórico (incluindo jogo)
                         const histBody = document.getElementById('lista-historico');
                         if (data.perfil.historico && data.perfil.historico.length > 0) {
                             histBody.innerHTML = data.perfil.historico.map(h => `
@@ -1393,17 +1383,15 @@ def pagina_fidelidade():
                         }
                     }
                 } catch(e) {
-                    alert('Erro ao consultar UID: ' + e.message);
+                    mostrarAlerta('Erro ao consultar perfil: ' + e.message, false);
                 }
             }
 
             async function resgatarItem(recompensaId) {
                 if (!currentUID) return;
-                // Buscar dados da recompensa para exibir confirmação
                 const rec = recompensas.find(r => r.id === recompensaId);
                 if (!rec) { alert('Recompensa não encontrada!'); return; }
                 if (!confirm(`Deseja trocar ${rec.pontos} pontos por "${rec.nome}"?`)) return;
-
                 try {
                     const resp = await fetch('/api/fidelidade/resgatar', {
                         method: 'POST',
@@ -1411,9 +1399,9 @@ def pagina_fidelidade():
                         body: JSON.stringify({ uid: currentUID, recompensa: recompensaId })
                     });
                     const res = await resp.json();
-                    alert(res.mensagem);
+                    mostrarAlerta(res.mensagem, res.sucesso);
                     if (res.sucesso) consultarPerfil();
-                } catch(e) { alert('Erro: ' + e.message); }
+                } catch(e) { mostrarAlerta('Erro: ' + e.message, false); }
             }
 
             async function enviarPedidoServico() {
@@ -1423,12 +1411,10 @@ def pagina_fidelidade():
                 const valor = parseFloat(document.getElementById('ped-valor').value);
                 const discord = document.getElementById('ped-discord').value.trim();
                 const cupom = document.getElementById('ped-cupom').value.trim();
-
                 if (!servico || isNaN(valor) || valor <= -1 || !discord) {
                     alert('Preencha o serviço, jogo (opcional), valor válido e seu Nick.');
                     return;
                 }
-
                 try {
                     const resp = await fetch('/api/fidelidade/solicitar_servico', {
                         method: 'POST',
@@ -1443,7 +1429,7 @@ def pagina_fidelidade():
                         })
                     });
                     const res = await resp.json();
-                    alert(res.mensagem);
+                    mostrarAlerta(res.mensagem, res.sucesso);
                     if (res.sucesso) {
                         document.getElementById('ped-servico').value = '';
                         document.getElementById('ped-jogo').value = '';
@@ -1451,32 +1437,200 @@ def pagina_fidelidade():
                         document.getElementById('ped-cupom').value = '';
                         consultarPerfil();
                     }
-                } catch(e) { alert('Erro: ' + e.message); }
+                } catch(e) { mostrarAlerta('Erro: ' + e.message, false); }
             }
 
-            // Inicialização
+            // Funções de login/cadastro
+            async function cadastrarCliente() {
+                const uid = document.getElementById('cad-uid').value.trim();
+                const senha = document.getElementById('cad-senha').value;
+                const senha2 = document.getElementById('cad-senha2').value;
+                const msg = document.getElementById('cad-msg');
+
+                if (!uid || !senha || !senha2) {
+                    msg.textContent = 'Preencha todos os campos.';
+                    msg.style.color = '#ff4757';
+                    return;
+                }
+                if (senha !== senha2) {
+                    msg.textContent = 'As senhas não coincidem.';
+                    msg.style.color = '#ff4757';
+                    return;
+                }
+                try {
+                    const resp = await fetch('/api/cliente/cadastrar', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ uid, senha })
+                    });
+                    const data = await resp.json();
+                    msg.textContent = data.mensagem;
+                    msg.style.color = data.sucesso ? '#2ed573' : '#ff4757';
+                    if (data.sucesso) {
+                        // Limpa campos
+                        document.getElementById('cad-uid').value = '';
+                        document.getElementById('cad-senha').value = '';
+                        document.getElementById('cad-senha2').value = '';
+                        // Faz login automático
+                        await loginCliente(uid, senha);
+                    }
+                } catch(e) {
+                    msg.textContent = 'Erro: ' + e.message;
+                    msg.style.color = '#ff4757';
+                }
+            }
+
+            async function loginCliente(uid, senha) {
+                if (!uid) uid = document.getElementById('login-uid').value.trim();
+                if (!senha) senha = document.getElementById('login-senha').value;
+                const status = document.getElementById('login-status');
+                if (!uid || !senha) {
+                    status.textContent = 'Preencha UID e senha.';
+                    status.style.color = '#ff4757';
+                    return;
+                }
+                try {
+                    const resp = await fetch('/api/cliente/login', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ uid, senha })
+                    });
+                    const data = await resp.json();
+                    if (data.sucesso) {
+                        window.location.reload(); // recarrega a página para mostrar o painel
+                    } else {
+                        status.textContent = data.mensagem;
+                        status.style.color = '#ff4757';
+                    }
+                } catch(e) {
+                    status.textContent = 'Erro: ' + e.message;
+                    status.style.color = '#ff4757';
+                }
+            }
+
+            async function logoutCliente() {
+                const resp = await fetch('/api/cliente/logout', { method: 'POST' });
+                const data = await resp.json();
+                if (data.sucesso) {
+                    window.location.reload();
+                }
+            }
+
+            function mostrarAlerta(msg, sucesso) {
+                const el = document.getElementById('msg-alert');
+                if (!el) return;
+                el.textContent = msg;
+                el.className = 'alert ' + (sucesso ? 'alert-success' : 'alert-error');
+                el.style.display = 'block';
+                setTimeout(() => el.style.display = 'none', 4000);
+            }
+
             document.addEventListener('DOMContentLoaded', async function() {
                 await carregarRecompensas();
                 renderizarRecompensas();
+                if (isLoggedIn) {
+                    consultarPerfil();
+                }
             });
         </script>
     </body>
     </html>
-    '''
+    """, pix_html=pix_html, is_logado=is_logado, uid_logado=uid_logado)
 
+
+# ==========================================
+# ROTAS DE AUTENTICAÇÃO DO CLIENTE
+# ==========================================
+
+@app.route("/api/cliente/cadastrar", methods=["POST"])
+def api_cliente_cadastrar():
+    req = request.get_json() or {}
+    uid = str(req.get("uid", "")).strip()
+    senha = req.get("senha", "")
+
+    if not uid or not senha:
+        return jsonify({"sucesso": False, "mensagem": "UID e senha são obrigatórios."})
+
+    # Verificar se senha atende aos requisitos
+    if not validar_senha(senha):
+        return jsonify({
+            "sucesso": False,
+            "mensagem": "A senha deve ter no mínimo 8 caracteres, com letra maiúscula, minúscula, número e caractere especial."
+        })
+
+    credenciais = dados.setdefault("credenciais", {})
+    if uid in credenciais:
+        return jsonify({"sucesso": False, "mensagem": "Este UID já possui cadastro."})
+
+    # Criar hash
+    cred = hash_senha(senha)
+    credenciais[uid] = cred
+    salvar_dados_github(f"Novo cadastro de cliente: {uid}")
+    return jsonify({"sucesso": True, "mensagem": "Cadastro realizado com sucesso! Faça login."})
+
+
+@app.route("/api/cliente/login", methods=["POST"])
+def api_cliente_login():
+    req = request.get_json() or {}
+    uid = str(req.get("uid", "")).strip()
+    senha = req.get("senha", "")
+
+    if not uid or not senha:
+        return jsonify({"sucesso": False, "mensagem": "UID e senha são obrigatórios."})
+
+    credenciais = dados.get("credenciais", {})
+    cred = credenciais.get(uid)
+    if not cred:
+        return jsonify({"sucesso": False, "mensagem": "UID não cadastrado."})
+
+    if not verificar_senha(senha, cred):
+        return jsonify({"sucesso": False, "mensagem": "Senha incorreta."})
+
+    session['cliente'] = {"uid": uid}
+    return jsonify({"sucesso": True, "mensagem": "Login realizado com sucesso."})
+
+
+@app.route("/api/cliente/logout", methods=["POST"])
+def api_cliente_logout():
+    session.pop('cliente', None)
+    return jsonify({"sucesso": True, "mensagem": "Logout realizado."})
+
+
+# ==========================================
+# ROTAS DA API DE FIDELIDADE (AGORA COM AUTENTICAÇÃO)
+# ==========================================
 
 @app.route("/api/fidelidade/consultar")
 def api_fidelidade_consultar():
-    uid = request.args.get('uid')
-    if not uid:
+    # Verifica se o cliente está logado
+    cliente = session.get('cliente')
+    if not cliente:
+        return jsonify({"sucesso": False, "mensagem": "Você precisa estar logado."}), 401
+
+    uid_sessao = cliente.get('uid')
+    uid_param = request.args.get('uid')
+    if not uid_param:
         return jsonify({"sucesso": False, "mensagem": "UID não informado"})
 
-    perfil = obter_ou_criar_perfil_fidelidade(uid)
-    return jsonify({"sucesso": True, "uid": uid, "perfil": perfil})
+    # Garantir que o cliente só consulte seu próprio UID
+    if uid_sessao != uid_param:
+        return jsonify({"sucesso": False, "mensagem": "Acesso negado."}), 403
+
+    perfil = obter_ou_criar_perfil_fidelidade(uid_param)
+    validade_pontos = None
+    if perfil.get("pontos", 0) > 0:
+        ultimo_pedido = perfil.get("ultimo_pedido_ts", time.time())
+        data_validade = datetime.fromtimestamp(ultimo_pedido + 60 * 86400).strftime("%d/%m/%Y")
+        validade_pontos = data_validade
+    return jsonify({"sucesso": True, "uid": uid_param, "perfil": perfil, "validade_pontos": validade_pontos})
 
 
 @app.route("/api/fidelidade/resgatar", methods=["POST"])
 def api_fidelidade_resgatar():
+    cliente = session.get('cliente')
+    if not cliente:
+        return jsonify({"sucesso": False, "mensagem": "Não autorizado."}), 401
+
     req = request.get_json() or {}
     uid = req.get("uid")
     recompensa_id = req.get("recompensa")
@@ -1484,22 +1638,20 @@ def api_fidelidade_resgatar():
     if not uid or not recompensa_id:
         return jsonify({"sucesso": False, "mensagem": "Dados inválidos"})
 
+    if cliente['uid'] != uid:
+        return jsonify({"sucesso": False, "mensagem": "Acesso negado."}), 403
+
     rec = obter_recompensa_por_id(recompensa_id)
     if not rec:
         return jsonify({"sucesso": False, "mensagem": "Recompensa não encontrada"})
 
     perfil = obter_ou_criar_perfil_fidelidade(uid)
-
     if perfil["pontos"] < rec["pontos"]:
         return jsonify({"sucesso": False, "mensagem": f"Pontos insuficientes! Você precisa de {rec['pontos']} pontos."})
 
-    # Deduz os pontos do cliente
     perfil["pontos"] -= rec["pontos"]
-
-    # Gera um token único de uso pessoal
     token = f"ZNK-{secrets.token_hex(3).upper()}"
     agora = time.time()
-
     novo_cupom = {
         "token": token,
         "recompensa_id": rec["id"],
@@ -1511,10 +1663,8 @@ def api_fidelidade_resgatar():
         "usado": False,
         "expirado": False
     }
-
     perfil["cupons"].append(novo_cupom)
     salvar_dados_github("Resgate de fidelidade")
-
     return jsonify({
         "sucesso": True,
         "mensagem": f"Resgate concluído! Seu código de cupom gerado é: {token}",
@@ -1524,6 +1674,10 @@ def api_fidelidade_resgatar():
 
 @app.route("/api/fidelidade/solicitar_servico", methods=["POST"])
 def api_fidelidade_solicitar_servico():
+    cliente = session.get('cliente')
+    if not cliente:
+        return jsonify({"sucesso": False, "mensagem": "Não autorizado."}), 401
+
     req = request.get_json() or {}
     uid = req.get("uid")
     servico = req.get("servico")
@@ -1535,34 +1689,29 @@ def api_fidelidade_solicitar_servico():
     if not uid or not servico or valor <= -1:
         return jsonify({"sucesso": False, "mensagem": "Preencha todos os campos corretamente"})
 
+    if cliente['uid'] != uid:
+        return jsonify({"sucesso": False, "mensagem": "Acesso negado."}), 403
+
     perfil = obter_ou_criar_perfil_fidelidade(uid)
     cupom_aplicado = None
-
-    # Validação do Cupom
     if cupom_token:
         encontrado = None
         for c in perfil.get("cupons", []):
             if c["token"] == cupom_token:
                 encontrado = c
                 break
-
         if not encontrado:
             return jsonify({"sucesso": False, "mensagem": "Cupom não encontrado ou não pertence a este UID!"})
         if encontrado.get("usado"):
             return jsonify({"sucesso": False, "mensagem": "Este cupom já foi utilizado!"})
         if encontrado.get("expirado"):
             return jsonify({"sucesso": False, "mensagem": "Este cupom expirou (prazo de 30 dias)!"})
-
-        # Abate o valor do cupom se for cupom financeiro
         if encontrado["tipo"] == "cupom":
             valor = max(0.0, valor - encontrado["desconto"])
-
-        # Marca cupom como utilizado
         encontrado["usado"] = True
         cupom_aplicado = encontrado["nome"]
 
     dados.setdefault("pedidos_fidelidade_pendentes", [])
-
     novo_pedido = {
         "id": str(uuid.uuid4())[:8],
         "uid": uid,
@@ -1575,10 +1724,8 @@ def api_fidelidade_solicitar_servico():
         "data_str": time.strftime("%d/%m/%Y %H:%M"),
         "status": "aguardando_aprovacao"
     }
-
     dados["pedidos_fidelidade_pendentes"].append(novo_pedido)
     salvar_dados_github("Novo pedido de serviço solicitado")
-
     return jsonify({
         "sucesso": True,
         "mensagem": "Pedido enviado com sucesso! Aguarde a aprovação do Administrador."
@@ -1586,31 +1733,26 @@ def api_fidelidade_solicitar_servico():
 
 
 # ==========================================
-# ROTAS DE ADMIN PARA GERENCIAR RECOMPENSAS
+# ROTAS DE ADMIN PARA GERENCIAR RECOMPENSAS (mantidas)
 # ==========================================
 
 @app.route("/api/fidelidade/recompensas", methods=["GET"])
 def api_fidelidade_recompensas():
-    """Retorna a lista de recompensas disponíveis"""
     recs = obter_recompensas()
     return jsonify({"sucesso": True, "recompensas": recs})
 
 
 @app.route("/api/fidelidade/recompensas", methods=["POST"])
 def api_fidelidade_recompensas_adicionar():
-    """Adiciona uma nova recompensa"""
     if 'usuario' not in session:
         return jsonify({"sucesso": False, "mensagem": "Não autorizado"}), 401
-
     req = request.get_json() or {}
     nome = req.get("nome", "").strip()
     pontos = int(req.get("pontos", 0))
     tipo = req.get("tipo", "servico")
     desconto = float(req.get("desconto", 0))
-
     if not nome or pontos <= 0:
         return jsonify({"sucesso": False, "mensagem": "Nome e pontos são obrigatórios"})
-
     recs = obter_recompensas()
     new_id = f"rec_{int(time.time())}"
     nova = {
@@ -1627,10 +1769,8 @@ def api_fidelidade_recompensas_adicionar():
 
 @app.route("/api/fidelidade/recompensas/<recompensa_id>", methods=["PUT"])
 def api_fidelidade_recompensas_editar(recompensa_id):
-    """Edita uma recompensa existente"""
     if 'usuario' not in session:
         return jsonify({"sucesso": False, "mensagem": "Não autorizado"}), 401
-
     req = request.get_json() or {}
     recs = obter_recompensas()
     for i, r in enumerate(recs):
@@ -1646,10 +1786,8 @@ def api_fidelidade_recompensas_editar(recompensa_id):
 
 @app.route("/api/fidelidade/recompensas/<recompensa_id>", methods=["DELETE"])
 def api_fidelidade_recompensas_remover(recompensa_id):
-    """Remove uma recompensa"""
     if 'usuario' not in session:
         return jsonify({"sucesso": False, "mensagem": "Não autorizado"}), 401
-
     recs = obter_recompensas()
     for i, r in enumerate(recs):
         if r["id"] == recompensa_id:
@@ -1660,37 +1798,32 @@ def api_fidelidade_recompensas_remover(recompensa_id):
 
 
 # ==========================================
-# ROTAS DO ADMINISTRADOR PARA GESTÃO DE PEDIDOS
+# ROTAS DO ADMINISTRADOR PARA GESTÃO DE PEDIDOS (mantidas)
 # ==========================================
 
 @app.route("/api/fidelidade/admin/pendentes")
 def api_fidelidade_admin_pendentes():
-    """Lista pedidos aguardando aprovação do admin"""
+    if 'usuario' not in session:
+        return jsonify({"sucesso": False, "mensagem": "Não autorizado"}), 401
     pendentes = dados.get("pedidos_fidelidade_pendentes", [])
     return jsonify({"sucesso": True, "pedidos": pendentes})
 
 
 @app.route("/api/fidelidade/admin/aprovar", methods=["POST"])
 def api_fidelidade_admin_aprovar():
-    """Aprova pedido do cliente e coloca AUTOMATICAMENTE na Fila do Bot"""
+    if 'usuario' not in session:
+        return jsonify({"sucesso": False, "mensagem": "Não autorizado"}), 401
     req = request.get_json() or {}
     pedido_id = req.get("pedido_id")
-
     pendentes = dados.get("pedidos_fidelidade_pendentes", [])
     pedido = next((p for p in pendentes if p["id"] == pedido_id), None)
-
     if not pedido:
         return jsonify({"sucesso": False, "mensagem": "Pedido não encontrado"})
-
-    # 1. Usa a estrutura padronizada da fila
     fila = obter_dados_fila()
-
-    # Verifica se a fila está aberta e tem espaço
     if not fila["configuracoes"]["aberta"]:
         return jsonify({"sucesso": False, "mensagem": "A fila está fechada no momento."})
     if len(fila["entradas"]) >= fila["configuracoes"]["tamanho_maximo"]:
         return jsonify({"sucesso": False, "mensagem": "A fila está cheia."})
-
     nova_entrada_fila = {
         "id": str(uuid.uuid4()),
         "posicao": len(fila["entradas"]) + 1,
@@ -1702,31 +1835,26 @@ def api_fidelidade_admin_aprovar():
         "timestamp": agora_br().isoformat(),
         "status": "aguardando"
     }
-
     fila["entradas"].append(nova_entrada_fila)
-
-    # 2. Remove da lista de pendentes
     dados["pedidos_fidelidade_pendentes"] = [p for p in pendentes if p["id"] != pedido_id]
     salvar_dados_github("Pedido aprovado e enviado para a fila")
-
     return jsonify({"sucesso": True, "mensagem": "Pedido aprovado e inserido na Fila com sucesso!"})
 
 
 @app.route("/api/fidelidade/admin/recusar", methods=["POST"])
 def api_fidelidade_admin_recusar():
-    """Recusa um pedido pendente"""
+    if 'usuario' not in session:
+        return jsonify({"sucesso": False, "mensagem": "Não autorizado"}), 401
     req = request.get_json() or {}
     pedido_id = req.get("pedido_id")
-
     pendentes = dados.get("pedidos_fidelidade_pendentes", [])
     dados["pedidos_fidelidade_pendentes"] = [p for p in pendentes if p["id"] != pedido_id]
     salvar_dados_github("Pedido recusado")
-
     return jsonify({"sucesso": True, "mensagem": "Pedido recusado e removido."})
 
 
 # ========================
-# ROTAS DA FILA
+# ROTAS DA FILA (com link para /pedido)
 # ========================
 
 @app.route("/fila")
@@ -1734,66 +1862,85 @@ def fila_publica():
     fila = obter_dados_fila()
     links = obter_links_fila()
     botoes_precos = links.get("botoes_precos", [])
-
     botoes_html = ""
     for botao in botoes_precos:
         botoes_html += f'<a href="{escape_html(botao["url"])}" target="_blank" class="btn-link btn-link-precos">💰 {escape_html(botao["nome"])}</a>'
-
-    return f'''
+    # Adiciona botão para /pedido
+    link_pedido = '<a href="/pedido" class="btn-link btn-link-pedido">📝 Solicitar Serviço</a>'
+    return render_template_string("""
     <!DOCTYPE html>
     <html>
     <head>
         <meta charset="UTF-8">
         <meta http-equiv="refresh" content="30">
-        <title>{escape_html(fila["nome"])}</title>
+        <title>{{ fila.nome }}</title>
         <style>
-            * {{ margin:0; padding:0; box-sizing:border-box; }}
-            body {{ font-family: 'Segoe UI', sans-serif; background: linear-gradient(135deg, #0f0c29, #302b63, #24243e); min-height:100vh; padding:20px; color:#fff; }}
-            .container {{ max-width:800px; margin:0 auto; }}
-            .header {{ text-align:center; margin-bottom:30px; padding:20px; background:rgba(0,0,0,0.5); border-radius:20px; }}
-            h1 {{ background: linear-gradient(135deg, #ff6b6b, #ffd93d); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }}
-            .status {{ display:inline-block; padding:5px 15px; border-radius:20px; }}
-            .status-aberta {{ background:#00b894; }}
-            .status-fechada {{ background:#d63031; }}
-            .links-container {{ display: flex; justify-content: center; gap: 20px; margin: 20px 0; flex-wrap: wrap; }}
-            .btn-link {{ display: inline-flex; align-items: center; gap: 10px; padding: 12px 24px; border-radius: 30px; text-decoration: none; font-weight: bold; transition: all 0.3s; }}
-            .btn-link-discord {{ background: #5865F2; color: white; }}
-            .btn-link-discord:hover {{ background: #4752C4; transform: translateY(-2px); }}
-            .btn-link-precos {{ background: #f59e0b; color: white; }}
-            .btn-link-precos:hover {{ background: #d97706; transform: translateY(-2px); }}
-            .lista-fila {{ background:rgba(0,0,0,0.4); border-radius:20px; overflow:hidden; }}
-            .cabecalho-fila {{ display:grid; grid-template-columns:60px 1fr 1fr 1fr 80px; padding:15px; background:rgba(255,255,255,0.1); font-weight:bold; }}
-            .item-fila {{ display:grid; grid-template-columns:60px 1fr 1fr 1fr 80px; padding:12px 15px; border-bottom:1px solid rgba(255,255,255,0.1); }}
-            .posicao {{ font-weight:bold; color:#ffd93d; }}
-            .servico {{ color:#a8e6cf; }}
-            .jogo {{ color:#ffb347; }}
-            .vazio {{ text-align:center; padding:40px; }}
-            .footer {{ text-align:center; margin-top:20px; font-size:0.8rem; color:#888; }}
+            * { margin:0; padding:0; box-sizing:border-box; }
+            body { font-family: 'Segoe UI', sans-serif; background: linear-gradient(135deg, #0f0c29, #302b63, #24243e); min-height:100vh; padding:20px; color:#fff; }
+            .container { max-width:800px; margin:0 auto; }
+            .header { text-align:center; margin-bottom:30px; padding:20px; background:rgba(0,0,0,0.5); border-radius:20px; }
+            h1 { background: linear-gradient(135deg, #ff6b6b, #ffd93d); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+            .status { display:inline-block; padding:5px 15px; border-radius:20px; }
+            .status-aberta { background:#00b894; }
+            .status-fechada { background:#d63031; }
+            .links-container { display: flex; justify-content: center; gap: 20px; margin: 20px 0; flex-wrap: wrap; }
+            .btn-link { display: inline-flex; align-items: center; gap: 10px; padding: 12px 24px; border-radius: 30px; text-decoration: none; font-weight: bold; transition: all 0.3s; }
+            .btn-link-discord { background: #5865F2; color: white; }
+            .btn-link-discord:hover { background: #4752C4; transform: translateY(-2px); }
+            .btn-link-precos { background: #f59e0b; color: white; }
+            .btn-link-precos:hover { background: #d97706; transform: translateY(-2px); }
+            .btn-link-pedido { background: #00b894; color: white; }
+            .btn-link-pedido:hover { background: #00a381; transform: translateY(-2px); }
+            .lista-fila { background:rgba(0,0,0,0.4); border-radius:20px; overflow:hidden; }
+            .cabecalho-fila { display:grid; grid-template-columns:60px 1fr 1fr 1fr 80px; padding:15px; background:rgba(255,255,255,0.1); font-weight:bold; }
+            .item-fila { display:grid; grid-template-columns:60px 1fr 1fr 1fr 80px; padding:12px 15px; border-bottom:1px solid rgba(255,255,255,0.1); }
+            .posicao { font-weight:bold; color:#ffd93d; }
+            .servico { color:#a8e6cf; }
+            .jogo { color:#ffb347; }
+            .vazio { text-align:center; padding:40px; }
+            .footer { text-align:center; margin-top:20px; font-size:0.8rem; color:#888; }
         </style>
     </head>
     <body>
         <div class="container">
             <div class="header">
-                <h1>📋 {escape_html(fila["nome"])}</h1>
-                <span class="status status-{'aberta' if fila['configuracoes']['aberta'] else 'fechada'}">{'🟢 ABERTA' if fila['configuracoes']['aberta'] else '🔴 FECHADA'}</span>
-                <div>📊 {len(fila["entradas"])} / {fila["configuracoes"]["tamanho_maximo"]} pessoas</div>
+                <h1>📋 {{ fila.nome }}</h1>
+                <span class="status status-{{ 'aberta' if fila.configuracoes.aberta else 'fechada' }}">{{ '🟢 ABERTA' if fila.configuracoes.aberta else '🔴 FECHADA' }}</span>
+                <div>📊 {{ fila.entradas|length }} / {{ fila.configuracoes.tamanho_maximo }} pessoas</div>
             </div>
-            
             <div class="links-container">
-                {'<a href="' + escape_html(links["discord_convite"]) + '" target="_blank" class="btn-link btn-link-discord">💬 Entrar no Discord</a>' if links.get("discord_convite") else ''}
-                {botoes_html}
+                {% if links.discord_convite %}
+                    <a href="{{ links.discord_convite }}" target="_blank" class="btn-link btn-link-discord">💬 Entrar no Discord</a>
+                {% endif %}
+                {{ botoes_html|safe }}
+                {{ link_pedido|safe }}
             </div>
-            
             <div class="lista-fila">
                 <div class="cabecalho-fila"><span>#</span><span>Jogador</span><span>Serviço</span><span>Jogo</span><span></span></div>
-                {''.join(f'<div class="item-fila"><span class="posicao">{e["posicao"]}</span><span>{escape_html(e["nome_usuario"])}</span><span class="servico">{escape_html(e["servico"])}</span><span class="jogo">{escape_html(e.get("jogo", ""))}</span><span>⏳</span></div>' for e in fila["entradas"]) or '<div class="vazio">✨ Ninguém na fila</div>'}
+                {% if fila.entradas %}
+                    {% for e in fila.entradas %}
+                        <div class="item-fila">
+                            <span class="posicao">{{ e.posicao }}</span>
+                            <span>{{ e.nome_usuario }}</span>
+                            <span class="servico">{{ e.servico }}</span>
+                            <span class="jogo">{{ e.jogo or '' }}</span>
+                            <span>⏳</span>
+                        </div>
+                    {% endfor %}
+                {% else %}
+                    <div class="vazio">✨ Ninguém na fila</div>
+                {% endif %}
             </div>
-            <div class="footer">Atualizado a cada 30s • {agora_br().strftime("%d/%m/%Y %H:%M:%S")}</div>
+            <div class="footer">Atualizado a cada 30s • {{ agora_br().strftime("%d/%m/%Y %H:%M:%S") }}</div>
         </div>
     </body>
     </html>
-    '''
+    """, fila=fila, links=links, botoes_html=botoes_html, link_pedido=link_pedido, agora_br=agora_br)
 
+
+# ========================
+# ROTAS DA FILA (embed, api, etc) - inalteradas
+# ========================
 
 @app.route("/fila/embed")
 def fila_embed():
@@ -1822,14 +1969,15 @@ def fila_api():
             "tamanho_maximo": fila["configuracoes"]["tamanho_maximo"],
             "contagem": len(fila["entradas"]),
             "entradas": [{"posicao": e["posicao"], "nome_usuario": e["nome_usuario"], "servico": e["servico"],
-                          "jogo": e.get("jogo", ""), "timestamp": e["timestamp"], "id": e["id"]} for e in
-                         fila["entradas"]]
+                          "jogo": e.get("jogo", ""), "timestamp": e["timestamp"], "id": e["id"], "uid": e.get("uid", "")} for e in
+                         fila["entradas"]],
+            "historico": fila["historico"]
         }
     })
 
 
 # ========================
-# APIs DA FILA
+# APIs DA FILA (mantidas)
 # ========================
 
 @app.route("/api/fila/adicionar", methods=["POST"])
@@ -1838,9 +1986,10 @@ def api_fila_adicionar():
     nome = dados_req.get("nome_usuario", "").strip()
     servico = dados_req.get("servico", "").strip()
     jogo = dados_req.get("jogo", "").strip()
+    uid = dados_req.get("uid", "").strip()
     if not nome or not servico:
         return jsonify({"sucesso": False, "mensagem": "Nome e serviço são obrigatórios"})
-    sucesso, resultado = adicionar_fila(nome, servico, jogo)
+    sucesso, resultado = adicionar_fila(nome, servico, jogo, usuario_id=nome, uid=uid)
     return jsonify({"sucesso": sucesso, "mensagem": f"{nome} adicionado!" if sucesso else resultado})
 
 
@@ -1870,24 +2019,18 @@ def api_fila_mover_baixo():
 
 @app.route("/api/fila/concluir", methods=["POST"])
 def api_fila_concluir():
-    """Conclui o serviço da fila, move para o Histórico do Cliente e CREDITA OS PONTOS (R$ 1 = 1 Ponto)"""
     req = request.get_json() or {}
     entrada_id = req.get("entrada_id")
-
     fila = dados.get("fila", {}).get("entradas", [])
     item_concluido = next((e for e in fila if e["id"] == entrada_id), None)
-
     if item_concluido:
         uid = item_concluido.get("uid")
         valor = float(item_concluido.get("valor", 0))
-
         if uid and valor > 0:
             perfil = obter_ou_criar_perfil_fidelidade(uid)
             pontos_ganhos = int(valor)
-
             perfil["pontos"] += pontos_ganhos
             perfil["ultimo_pedido_ts"] = time.time()
-
             perfil["historico"].insert(0, {
                 "servico": item_concluido.get("servico", "Serviço"),
                 "jogo": item_concluido.get("jogo", ""),
@@ -1895,15 +2038,11 @@ def api_fila_concluir():
                 "pontos": pontos_ganhos,
                 "data": time.strftime("%d/%m/%Y")
             })
-
-        dados["fila"]["entradas"] = [e for e in fila if e["id"] != entrada_id]
-
-        for idx, entrada in enumerate(dados["fila"]["entradas"], 1):
-            entrada["posicao"] = idx
-
-        salvar_dados_github("Serviço concluído na fila e pontos creditados")
-        return jsonify({"sucesso": True, "mensagem": "Serviço concluído e pontos creditados ao cliente!"})
-
+        sucesso, removido = concluir_servico(entrada_id)
+        if sucesso:
+            return jsonify({"sucesso": True, "mensagem": "Serviço concluído e pontos creditados ao cliente!"})
+        else:
+            return jsonify({"sucesso": False, "mensagem": "Erro ao concluir serviço"})
     return jsonify({"sucesso": False, "mensagem": "Entrada não encontrada na fila"})
 
 
@@ -1920,7 +2059,14 @@ def api_fila_configuracoes():
     if request.method == "GET":
         fila = obter_dados_fila()
         links = obter_links_fila()
-        return jsonify({"sucesso": True, "configuracoes": fila["configuracoes"], "nome": fila["nome"], "links": links})
+        config = dados.get("config", {})
+        return jsonify({
+            "sucesso": True,
+            "configuracoes": fila["configuracoes"],
+            "nome": fila["nome"],
+            "links": links,
+            "pix_link": config.get("pix_link", "")
+        })
     if 'usuario' not in session:
         return jsonify({"sucesso": False}), 401
     req = request.json
@@ -1932,11 +2078,14 @@ def api_fila_configuracoes():
         definir_nome_fila(req["nome"])
     if "discord_convite" in req:
         salvar_links_fila(req.get("discord_convite", ""))
+    if "pix_link" in req:
+        dados.setdefault("config", {})["pix_link"] = req["pix_link"]
+        salvar_dados_github("PIX link atualizado")
     return jsonify({"sucesso": True})
 
 
 # ========================
-# APIs DOS BOTÕES DE PREÇO
+# APIs DOS BOTÕES DE PREÇO (mantidas)
 # ========================
 
 @app.route("/api/fila/botoes", methods=["GET"])
@@ -1984,7 +2133,7 @@ def api_fila_botoes_atualizar():
 
 
 # ========================
-# APIs DE CONFIGURAÇÃO
+# APIs DE CONFIGURAÇÃO (mantidas)
 # ========================
 
 @app.route("/api/servidor/canais")
@@ -2023,7 +2172,6 @@ def api_servidor_membros():
 def api_anti_spam():
     if 'usuario' not in session:
         return jsonify({"sucesso": False}), 401
-
     if request.method == "GET":
         anti_spam = dados.get("anti_spam", {})
         return jsonify({
@@ -2045,7 +2193,6 @@ def api_anti_spam():
                 ]))
             }
         })
-
     req = request.json
     executar_acao_bot("configurar_anti_spam", **req)
     return jsonify({"sucesso": True, "mensagem": "Configuração anti-spam salva!"})
@@ -2055,7 +2202,6 @@ def api_anti_spam():
 def api_config_boasvindas():
     if 'usuario' not in session:
         return jsonify({"sucesso": False}), 401
-
     if request.method == "GET":
         config = dados.get("config", {})
         return jsonify({
@@ -2064,7 +2210,6 @@ def api_config_boasvindas():
             "mensagem": config.get("mensagem_boas_vindas", "Olá {member}, seja bem-vindo(a)!"),
             "imagem": config.get("fundo_boas_vindas", "")
         })
-
     req = request.json
     executar_acao_bot("configurar_boas_vindas", **req)
     return jsonify({"sucesso": True, "mensagem": "Configuração salva!"})
@@ -2074,7 +2219,6 @@ def api_config_boasvindas():
 def api_config_xp():
     if 'usuario' not in session:
         return jsonify({"sucesso": False}), 401
-
     if request.method == "GET":
         config = dados.get("config", {})
         return jsonify({
@@ -2082,7 +2226,6 @@ def api_config_xp():
             "taxa": config.get("taxa_xp", 3),
             "canal": config.get("canal_levelup", "")
         })
-
     req = request.json
     executar_acao_bot("configurar_xp", **req)
     return jsonify({"sucesso": True, "mensagem": "Configuração salva!"})
@@ -2092,7 +2235,6 @@ def api_config_xp():
 def api_config_comandos():
     if 'usuario' not in session:
         return jsonify({"sucesso": False}), 401
-
     if request.method == "GET":
         config = dados.get("config", {})
         return jsonify({
@@ -2100,7 +2242,6 @@ def api_config_comandos():
             "canal_perfil": config.get("canal_perfil", ""),
             "canal_rank": config.get("canal_rank", "")
         })
-
     req = request.json
     executar_acao_bot("configurar_comandos", **req)
     return jsonify({"sucesso": True, "mensagem": "Configuração de comandos salva!"})
@@ -2110,15 +2251,12 @@ def api_config_comandos():
 def api_cargos_nivel():
     if 'usuario' not in session:
         return jsonify({"sucesso": False}), 401
-
     if request.method == "GET":
         return jsonify({"sucesso": True, "cargos": dados.get("cargos_nivel", {})})
-
     elif request.method == "POST":
         req = request.json
         executar_acao_bot("adicionar_cargo_nivel", nivel=req.get('nivel'), cargo_id=req.get('cargo_id'))
         return jsonify({"sucesso": True, "mensagem": "Cargo adicionado!"})
-
     elif request.method == "DELETE":
         nivel = request.args.get('nivel')
         if nivel:
@@ -2130,17 +2268,15 @@ def api_cargos_nivel():
 def api_config_links():
     if 'usuario' not in session:
         return jsonify({"sucesso": False}), 401
-
     if request.method == "GET":
         return jsonify({"sucesso": True, "canais": dados.get("canais_links_bloqueados", [])})
-
     req = request.json
     executar_acao_bot("alternar_bloqueio_links", canal_id=req.get('canal_id'))
     return jsonify({"sucesso": True, "mensagem": "Configuração salva!"})
 
 
 # ========================
-# APIs DE COMANDOS
+# APIs DE COMANDOS (mantidas)
 # ========================
 
 @app.route("/api/comando/embed", methods=["POST"])
@@ -2193,7 +2329,7 @@ def api_botoes_cargo_criar():
 
 
 # ========================
-# DASHBOARD PRINCIPAL (COM GESTÃO DE RECOMPENSAS)
+# DASHBOARD PRINCIPAL (mantido)
 # ========================
 
 @app.route("/dashboard")
@@ -2208,11 +2344,18 @@ def dashboard():
     links = obter_links_fila()
     botoes_precos = links.get("botoes_precos", [])
     recompensas = obter_recompensas()
+    historico = fila.get("historico", [])
+    pix_link = config.get("pix_link", "")
 
-    botoes_precos_json = json.dumps(botoes_precos)
-    recompensas_json = json.dumps(recompensas)
+    total_usuarios_xp = len(dados.get("xp", {}))
+    total_advertencias = sum(len(w) for w in dados.get("advertencias", {}).values())
+    total_fila = len(fila["entradas"])
+    status_bot = "✅ Online" if bot.is_ready() else "❌ Offline"
+    processador_status = "✅ Ativo" if processador_acoes_rodando else "❌ Inativo"
+    anti_spam_status = "✅ Ativo" if anti_spam.get('ativado', True) else "❌ Desativado"
+    total_recompensas = len(recompensas)
 
-    return f'''
+    return render_template_string("""
     <!DOCTYPE html>
     <html lang="pt-BR">
     <head>
@@ -2220,66 +2363,69 @@ def dashboard():
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Painel - Bot</title>
         <style>
-            :root {{ --primary: #5865F2; --primary-dark: #4752C4; --success: #10b981; --danger: #ef4444; --warning: #f59e0b; --dark: #1a1a1a; --darker: #121212; --light: #e0e0e0; --gray: #333; }}
-            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-            body {{ font-family: 'Segoe UI', sans-serif; background: var(--darker); color: var(--light); }}
-            header {{ background: var(--dark); padding: 1rem 2rem; border-bottom: 1px solid var(--gray); }}
-            .header-content {{ display: flex; justify-content: space-between; align-items: center; max-width: 1400px; margin: 0 auto; }}
-            h1 {{ color: var(--primary); }}
-            .user-info {{ display: flex; align-items: center; gap: 1rem; }}
-            .avatar {{ width: 40px; height: 40px; border-radius: 50%; border: 2px solid var(--primary); }}
-            .btn {{ padding: 0.5rem 1rem; border: none; border-radius: 5px; cursor: pointer; font-weight: 600; text-decoration: none; display: inline-block; transition: all 0.2s; }}
-            .btn-primary {{ background: var(--primary); color: white; }}
-            .btn-primary:hover {{ background: var(--primary-dark); }}
-            .btn-success {{ background: var(--success); color: white; }}
-            .btn-danger {{ background: var(--danger); color: white; }}
-            .btn-warning {{ background: var(--warning); color: white; }}
-            .btn-sm {{ padding: 0.25rem 0.5rem; font-size: 0.8rem; }}
-            .container {{ max-width: 1400px; margin: 2rem auto; padding: 0 1rem; }}
-            .tab-nav {{ display: flex; gap: 0.5rem; margin-bottom: 1rem; border-bottom: 2px solid var(--gray); flex-wrap: wrap; }}
-            .tab-btn {{ padding: 0.75rem 1.5rem; background: var(--gray); border: none; border-radius: 5px 5px 0 0; cursor: pointer; font-weight: 600; color: var(--light); }}
-            .tab-btn:hover {{ background: #444; }}
-            .tab-btn.active {{ background: var(--primary); color: white; }}
-            .tab {{ display: none; animation: fadeIn 0.3s; }}
-            .tab.active {{ display: block; }}
-            @keyframes fadeIn {{ from {{ opacity: 0; }} to {{ opacity: 1; }} }}
-            .card {{ background: var(--dark); border-radius: 10px; padding: 1.5rem; margin: 1rem 0; border: 1px solid var(--gray); }}
-            .stats-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1rem; }}
-            .stat-card {{ background: linear-gradient(135deg, var(--primary), var(--primary-dark)); color: white; padding: 1.5rem; border-radius: 10px; text-align: center; }}
-            .stat-card h3 {{ font-size: 2rem; }}
-            .form-group {{ margin-bottom: 1.5rem; }}
-            label {{ display: block; margin-bottom: 0.5rem; font-weight: 600; color: var(--primary); }}
-            .form-control {{ width: 100%; padding: 0.75rem; background: var(--darker); border: 1px solid var(--gray); border-radius: 5px; color: var(--light); }}
-            .form-control:focus {{ outline: none; border-color: var(--primary); }}
-            .alert {{ padding: 1rem; border-radius: 5px; margin: 1rem 0; display: none; }}
-            .alert-success {{ background: #1a472a; color: #4ade80; border: 1px solid #2ecc71; }}
-            .alert-error {{ background: #7f1d1d; color: #f87171; border: 1px solid #ef4444; }}
-            table {{ width: 100%; border-collapse: collapse; }}
-            th, td {{ text-align: left; padding: 12px; border-bottom: 1px solid var(--gray); }}
-            th {{ background: var(--gray); }}
-            .grid-2 {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 1rem; }}
-            .grid-3 {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }}
-            @media (max-width: 768px) {{ .grid-2, .grid-3 {{ grid-template-columns: 1fr; }} }}
-            .switch {{ position: relative; display: inline-block; width: 60px; height: 34px; }}
-            .switch input {{ opacity: 0; width: 0; height: 0; }}
-            .slider {{ position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; border-radius: 34px; }}
-            .slider:before {{ position: absolute; content: ""; height: 26px; width: 26px; left: 4px; bottom: 4px; background-color: white; transition: .4s; border-radius: 50%; }}
-            input:checked + .slider {{ background-color: #2196F3; }}
-            input:checked + .slider:before {{ transform: translateX(26px); }}
-            .info-box {{ background: #1a1a2e; border-left: 4px solid #5865F2; padding: 1rem; margin: 1rem 0; border-radius: 5px; }}
-            .config-badge {{ display: inline-block; background: #2196F3; color: white; padding: 2px 8px; border-radius: 10px; font-size: 11px; margin-left: 5px; }}
-            .config-removed {{ background: #f44336; }}
-            .botoes-lista {{ display: flex; flex-direction: column; gap: 10px; margin-top: 15px; }}
-            .botao-item {{ background: #1a1a1a; padding: 10px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }}
-            .botao-info {{ flex: 1; }}
-            .botao-nome {{ font-weight: bold; color: #f59e0b; }}
-            .botao-url {{ font-size: 12px; color: #888; word-break: break-all; }}
-            .botao-acoes {{ display: flex; gap: 8px; }}
-            .recompensa-item {{ background: #1a1a1a; padding: 10px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 8px; }}
-            .recompensa-info {{ flex: 1; }}
-            .recompensa-nome {{ font-weight: bold; color: #feca57; }}
-            .recompensa-detalhes {{ font-size: 12px; color: #aaa; }}
-            .recompensa-acoes {{ display: flex; gap: 8px; }}
+            :root { --primary: #5865F2; --primary-dark: #4752C4; --success: #10b981; --danger: #ef4444; --warning: #f59e0b; --dark: #1a1a1a; --darker: #121212; --light: #e0e0e0; --gray: #333; }
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body { font-family: 'Segoe UI', sans-serif; background: var(--darker); color: var(--light); }
+            header { background: var(--dark); padding: 1rem 2rem; border-bottom: 1px solid var(--gray); }
+            .header-content { display: flex; justify-content: space-between; align-items: center; max-width: 1400px; margin: 0 auto; }
+            h1 { color: var(--primary); }
+            .user-info { display: flex; align-items: center; gap: 1rem; }
+            .avatar { width: 40px; height: 40px; border-radius: 50%; border: 2px solid var(--primary); }
+            .btn { padding: 0.5rem 1rem; border: none; border-radius: 5px; cursor: pointer; font-weight: 600; text-decoration: none; display: inline-block; transition: all 0.2s; }
+            .btn-primary { background: var(--primary); color: white; }
+            .btn-primary:hover { background: var(--primary-dark); }
+            .btn-success { background: var(--success); color: white; }
+            .btn-danger { background: var(--danger); color: white; }
+            .btn-warning { background: var(--warning); color: white; }
+            .btn-sm { padding: 0.25rem 0.5rem; font-size: 0.8rem; }
+            .container { max-width: 1400px; margin: 2rem auto; padding: 0 1rem; }
+            .tab-nav { display: flex; gap: 0.5rem; margin-bottom: 1rem; border-bottom: 2px solid var(--gray); flex-wrap: wrap; }
+            .tab-btn { padding: 0.75rem 1.5rem; background: var(--gray); border: none; border-radius: 5px 5px 0 0; cursor: pointer; font-weight: 600; color: var(--light); }
+            .tab-btn:hover { background: #444; }
+            .tab-btn.active { background: var(--primary); color: white; }
+            .tab { display: none; animation: fadeIn 0.3s; }
+            .tab.active { display: block; }
+            @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+            .card { background: var(--dark); border-radius: 10px; padding: 1.5rem; margin: 1rem 0; border: 1px solid var(--gray); }
+            .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1rem; }
+            .stat-card { background: linear-gradient(135deg, var(--primary), var(--primary-dark)); color: white; padding: 1.5rem; border-radius: 10px; text-align: center; }
+            .stat-card h3 { font-size: 2rem; }
+            .form-group { margin-bottom: 1.5rem; }
+            label { display: block; margin-bottom: 0.5rem; font-weight: 600; color: var(--primary); }
+            .form-control { width: 100%; padding: 0.75rem; background: var(--darker); border: 1px solid var(--gray); border-radius: 5px; color: var(--light); }
+            .form-control:focus { outline: none; border-color: var(--primary); }
+            .alert { padding: 1rem; border-radius: 5px; margin: 1rem 0; display: none; }
+            .alert-success { background: #1a472a; color: #4ade80; border: 1px solid #2ecc71; }
+            .alert-error { background: #7f1d1d; color: #f87171; border: 1px solid #ef4444; }
+            table { width: 100%; border-collapse: collapse; }
+            th, td { text-align: left; padding: 12px; border-bottom: 1px solid var(--gray); }
+            th { background: var(--gray); }
+            .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1rem; }
+            .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
+            @media (max-width: 768px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } }
+            .switch { position: relative; display: inline-block; width: 60px; height: 34px; }
+            .switch input { opacity: 0; width: 0; height: 0; }
+            .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; border-radius: 34px; }
+            .slider:before { position: absolute; content: ""; height: 26px; width: 26px; left: 4px; bottom: 4px; background-color: white; transition: .4s; border-radius: 50%; }
+            input:checked + .slider { background-color: #2196F3; }
+            input:checked + .slider:before { transform: translateX(26px); }
+            .info-box { background: #1a1a2e; border-left: 4px solid #5865F2; padding: 1rem; margin: 1rem 0; border-radius: 5px; }
+            .config-badge { display: inline-block; background: #2196F3; color: white; padding: 2px 8px; border-radius: 10px; font-size: 11px; margin-left: 5px; }
+            .config-removed { background: #f44336; }
+            .botoes-lista { display: flex; flex-direction: column; gap: 10px; margin-top: 15px; }
+            .botao-item { background: #1a1a1a; padding: 10px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
+            .botao-info { flex: 1; }
+            .botao-nome { font-weight: bold; color: #f59e0b; }
+            .botao-url { font-size: 12px; color: #888; word-break: break-all; }
+            .botao-acoes { display: flex; gap: 8px; }
+            .recompensa-item { background: #1a1a1a; padding: 10px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+            .recompensa-info { flex: 1; }
+            .recompensa-nome { font-weight: bold; color: #feca57; }
+            .recompensa-detalhes { font-size: 12px; color: #aaa; }
+            .recompensa-acoes { display: flex; gap: 8px; }
+            .historico-fila { margin-top: 20px; }
+            .historico-fila .busca-uid { margin-bottom: 10px; display: flex; gap: 10px; align-items: center; }
+            .historico-fila .busca-uid input { flex: 1; padding: 8px; border-radius: 5px; border: 1px solid var(--gray); background: var(--darker); color: white; }
         </style>
     </head>
     <body>
@@ -2287,8 +2433,8 @@ def dashboard():
             <div class="header-content">
                 <h1> Painel de Controle</h1>
                 <div class="user-info">
-                    <img src="https://cdn.discordapp.com/avatars/{usuario['id']}/{usuario.get('avatar', '')}.png" class="avatar" onerror="this.src='https://cdn.discordapp.com/embed/avatars/0.png'">
-                    <span>{usuario['nome_usuario']}</span>
+                    <img src="https://cdn.discordapp.com/avatars/{{ usuario.id }}/{{ usuario.get('avatar', '') }}.png" class="avatar" onerror="this.src='https://cdn.discordapp.com/embed/avatars/0.png'">
+                    <span>{{ usuario.nome_usuario }}</span>
                     <a href="/" class="btn btn-primary">🏠 Início</a>
                     <a href="/fila" class="btn btn-primary">📋 Fila</a>
                     <a href="/logout" class="btn btn-danger">🚪 Sair</a>
@@ -2298,16 +2444,16 @@ def dashboard():
         
         <div class="container">
             <div class="tab-nav">
-                <button class="tab-btn active" onclick="showTab('inicio')">🏠 Início</button>
-                <button class="tab-btn" onclick="showTab('comandos_canais')">📢 Canais</button>
-                <button class="tab-btn" onclick="showTab('antispam')">🛡️ Anti-Spam</button>
-                <button class="tab-btn" onclick="showTab('boasvindas')">👋 Boas-vindas</button>
-                <button class="tab-btn" onclick="showTab('xp')">⭐ XP</button>
-                <button class="tab-btn" onclick="showTab('cargos')">🪪 Cargos</button>
-                <button class="tab-btn" onclick="showTab('moderacao')">🛡️ Moderação</button>
-                <button class="tab-btn" onclick="showTab('fila')">📋 Fila</button>
-                <button class="tab-btn" onclick="showTab('comandos')">⚡ Comandos</button>
-                <button class="tab-btn" onclick="showTab('recompensas')">🎁 Recompensas</button>
+                <button class="tab-btn active" onclick="showTab(event, 'inicio')">🏠 Início</button>
+                <button class="tab-btn" onclick="showTab(event, 'comandos_canais')">📢 Canais</button>
+                <button class="tab-btn" onclick="showTab(event, 'antispam')">🛡️ Anti-Spam</button>
+                <button class="tab-btn" onclick="showTab(event, 'boasvindas')">👋 Boas-vindas</button>
+                <button class="tab-btn" onclick="showTab(event, 'xp')">⭐ XP</button>
+                <button class="tab-btn" onclick="showTab(event, 'cargos')">🪪 Cargos</button>
+                <button class="tab-btn" onclick="showTab(event, 'moderacao')">🛡️ Moderação</button>
+                <button class="tab-btn" onclick="showTab(event, 'fila')">📋 Fila</button>
+                <button class="tab-btn" onclick="showTab(event, 'comandos')">⚡ Comandos</button>
+                <button class="tab-btn" onclick="showTab(event, 'recompensas')">🎁 Recompensas</button>
             </div>
             
             <!-- Aba Início -->
@@ -2316,18 +2462,18 @@ def dashboard():
                     <div class="card">
                         <h2>📊 Estatísticas</h2>
                         <div class="stats-grid">
-                            <div class="stat-card"><h3>{len(dados.get("xp", {}))}</h3><p>Usuários com XP</p></div>
-                            <div class="stat-card"><h3>{sum(len(w) for w in dados.get("advertencias", {}).values())}</h3><p>Advertências</p></div>
-                            <div class="stat-card"><h3>{len(fila["entradas"])}</h3><p>Na Fila</p></div>
+                            <div class="stat-card"><h3>{{ total_usuarios_xp }}</h3><p>Usuários com XP</p></div>
+                            <div class="stat-card"><h3>{{ total_advertencias }}</h3><p>Advertências</p></div>
+                            <div class="stat-card"><h3>{{ total_fila }}</h3><p>Na Fila</p></div>
                         </div>
                     </div>
                     <div class="card">
                         <h2>⚡ Status</h2>
-                        <p><strong>Bot:</strong> {'✅ Online' if bot.is_ready() else '❌ Offline'}</p>
-                        <p><strong>Processador:</strong> {'✅ Ativo' if processador_acoes_rodando else '❌ Inativo'}</p>
-                        <p><strong>Ações na fila:</strong> {len(acoes_fila_bot)}</p>
-                        <p><strong>Anti-Spam:</strong> {'✅ Ativo' if anti_spam.get('ativado', True) else '❌ Desativado'}</p>
-                        <p><strong>Recompensas cadastradas:</strong> {len(recompensas)}</p>
+                        <p><strong>Bot:</strong> {{ status_bot }}</p>
+                        <p><strong>Processador:</strong> {{ processador_status }}</p>
+                        <p><strong>Ações na fila:</strong> {{ acoes_fila_bot|length }}</p>
+                        <p><strong>Anti-Spam:</strong> {{ anti_spam_status }}</p>
+                        <p><strong>Recompensas cadastradas:</strong> {{ total_recompensas }}</p>
                     </div>
                 </div>
             </div>
@@ -2386,21 +2532,21 @@ def dashboard():
                         <div class="form-group">
                             <label>Status do Anti-Spam</label>
                             <label class="switch">
-                                <input type="checkbox" id="as-ativado" {'checked' if anti_spam.get('ativado', True) else ''}>
+                                <input type="checkbox" id="as-ativado" {{ 'checked' if anti_spam.get('ativado', True) else '' }}>
                                 <span class="slider"></span>
                             </label>
                         </div>
                         <div class="form-group">
                             <label>Remover XP por Spam</label>
                             <label class="switch">
-                                <input type="checkbox" id="as-remover-xp" {'checked' if anti_spam.get('remover_xp', True) else ''}>
+                                <input type="checkbox" id="as-remover-xp" {{ 'checked' if anti_spam.get('remover_xp', True) else '' }}>
                                 <span class="slider"></span>
                             </label>
                         </div>
                         <div class="form-group">
                             <label>Deletar Mensagens de Spam</label>
                             <label class="switch">
-                                <input type="checkbox" id="as-deletar" {'checked' if anti_spam.get('deletar_mensagens', True) else ''}>
+                                <input type="checkbox" id="as-deletar" {{ 'checked' if anti_spam.get('deletar_mensagens', True) else '' }}>
                                 <span class="slider"></span>
                             </label>
                         </div>
@@ -2408,27 +2554,27 @@ def dashboard():
                     <div class="grid-3">
                         <div class="form-group">
                             <label>Limite de Mensagens</label>
-                            <input type="number" id="as-limite" class="form-control" value="{anti_spam.get('limite_mensagens', 5)}" min="2" max="20">
+                            <input type="number" id="as-limite" class="form-control" value="{{ anti_spam.get('limite_mensagens', 5) }}" min="2" max="20">
                         </div>
                         <div class="form-group">
                             <label>Intervalo (segundos)</label>
-                            <input type="number" id="as-intervalo" class="form-control" value="{anti_spam.get('intervalo_segundos', 5)}" min="2" max="30">
+                            <input type="number" id="as-intervalo" class="form-control" value="{{ anti_spam.get('intervalo_segundos', 5) }}" min="2" max="30">
                         </div>
                         <div class="form-group">
                             <label>Tempo de Mute (minutos)</label>
-                            <input type="number" id="as-mute" class="form-control" value="{anti_spam.get('tempo_mute_minutos', 2)}" min="1" max="60">
+                            <input type="number" id="as-mute" class="form-control" value="{{ anti_spam.get('tempo_mute_minutos', 2) }}" min="1" max="60">
                         </div>
                         <div class="form-group">
                             <label>Penalidade de XP</label>
-                            <input type="number" id="as-xp-penalidade" class="form-control" value="{anti_spam.get('xp_penalidade', 50)}" min="10" max="500">
+                            <input type="number" id="as-xp-penalidade" class="form-control" value="{{ anti_spam.get('xp_penalidade', 50) }}" min="10" max="500">
                         </div>
                         <div class="form-group">
                             <label>Cargos Ignorados (separar por vírgula)</label>
-                            <input type="text" id="as-cargos" class="form-control" value="{','.join(anti_spam.get('cargos_ignorados', ['Administrador', 'Moderador', 'Staff', 'Dono']))}">
+                            <input type="text" id="as-cargos" class="form-control" value="{{ ','.join(anti_spam.get('cargos_ignorados', ['Administrador', 'Moderador', 'Staff', 'Dono'])) }}">
                         </div>
                         <div class="form-group">
                             <label>Comandos Ignorados (separar por vírgula)</label>
-                            <input type="text" id="as-comandos" class="form-control" value="{','.join(anti_spam.get('comandos_ignorados', ['$w','$wa','$wg','$h','$ha','$hg','$tu','$dk','$mmi','$vote','$rolls','$k','$mu']))}">
+                            <input type="text" id="as-comandos" class="form-control" value="{{ ','.join(anti_spam.get('comandos_ignorados', ['$w','$wa','$wg','$h','$ha','$hg','$tu','$dk','$mmi','$vote','$rolls','$k','$mu'])) }}">
                         </div>
                     </div>
                     <button onclick="salvarAntiSpam()" class="btn btn-primary">💾 Salvar Configurações</button>
@@ -2578,13 +2724,18 @@ def dashboard():
                 </div>
             </div>
             
-            <!-- Aba Fila (COM MÚLTIPLOS BOTÕES) -->
+            <!-- Aba Fila (COM MÚLTIPLOS BOTÕES, PIX E HISTÓRICO) -->
             <div id="fila" class="tab">
                 <div class="card">
                     <h2>📋 Configurações da Fila</h2>
                     <div class="grid-2">
-                        <div><label>Nome da Fila</label><input type="text" id="fila-nome" class="form-control" value="{escape_html(fila['nome'])}"></div>
-                        <div><label>Tamanho Máximo</label><input type="number" id="fila-max" class="form-control" value="{fila['configuracoes']['tamanho_maximo']}" min="1" max="100"></div>
+                        <div><label>Nome da Fila</label><input type="text" id="fila-nome" class="form-control" value="{{ fila.nome }}"></div>
+                        <div><label>Tamanho Máximo</label><input type="number" id="fila-max" class="form-control" value="{{ fila.configuracoes.tamanho_maximo }}" min="1" max="100"></div>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Link do PIX (no /pedido)</label>
+                        <input type="url" id="pix-link" class="form-control" value="{{ pix_link }}" placeholder="https://... ou chave pix">
                     </div>
                     
                     <div class="card" style="margin-top: 20px; background: #1e1e1e; padding: 15px; border-radius: 8px;">
@@ -2595,7 +2746,7 @@ def dashboard():
                     <h3 style="margin-top: 20px;">🔗 Links do Discord (convite)</h3>
                     <div class="form-group">
                         <label>Link do Discord (convite)</label>
-                        <input type="url" id="link-discord" class="form-control" placeholder="https://discord.gg/seuconvite" value="{escape_html(links.get('discord_convite', ''))}">
+                        <input type="url" id="link-discord" class="form-control" placeholder="https://discord.gg/seuconvite" value="{{ links.get('discord_convite', '') }}">
                     </div>
                     
                     <h3 style="margin-top: 20px;">💰 Botões de Preço (Múltiplos)</h3>
@@ -2613,16 +2764,14 @@ def dashboard():
                     </div>
                     <button onclick="adicionarBotaoPreco()" class="btn btn-success">➕ Adicionar Botão</button>
                     
-                    <div id="botoes-precos-lista" class="botoes-lista" style="margin-top: 20px;">
-                        <!-- Lista de botões será carregada aqui -->
-                    </div>
+                    <div id="botoes-precos-lista" class="botoes-lista" style="margin-top: 20px;"></div>
                     
                     <div style="display: flex; gap: 1rem; margin-top: 1rem;">
                         <button onclick="salvarConfigFila()" class="btn btn-primary">💾 Salvar Configurações</button>
-                        <button onclick="alternarStatusFila()" id="toggle-fila-btn" class="btn {'btn-success' if fila['configuracoes']['aberta'] else 'btn-danger'}">{'🔓 Fechar Fila' if fila['configuracoes']['aberta'] else '🔒 Abrir Fila'}</button>
+                        <button onclick="alternarStatusFila()" id="toggle-fila-btn" class="btn {{ 'btn-success' if fila.configuracoes.aberta else 'btn-danger' }}">{{ '🔓 Fechar Fila' if fila.configuracoes.aberta else '🔒 Abrir Fila' }}</button>
                         <button onclick="limparFila()" class="btn btn-danger">🗑️ Limpar Fila</button>
                     </div>
-                    <div id="fila-status" style="margin-top: 1rem; padding: 0.5rem; background: #1a1a1a; border-radius: 5px;">Status: {'🟢 ABERTA' if fila['configuracoes']['aberta'] else '🔴 FECHADA'} | {len(fila['entradas'])}/{fila['configuracoes']['tamanho_maximo']}</div>
+                    <div id="fila-status" style="margin-top: 1rem; padding: 0.5rem; background: #1a1a1a; border-radius: 5px;">Status: {{ '🟢 ABERTA' if fila.configuracoes.aberta else '🔴 FECHADA' }} | {{ fila.entradas|length }}/{{ fila.configuracoes.tamanho_maximo }}</div>
                 </div>
                 
                 <div class="card">
@@ -2631,6 +2780,7 @@ def dashboard():
                         <input type="text" id="add-nome" class="form-control" placeholder="Nome do jogador" style="flex:1;">
                         <input type="text" id="add-servico" class="form-control" placeholder="Serviço" style="flex:1;">
                         <input type="text" id="add-jogo" class="form-control" placeholder="Jogo" style="flex:1;">
+                        <input type="text" id="add-uid" class="form-control" placeholder="UID (opcional)" style="flex:1;">
                         <button onclick="adicionarFila()" class="btn btn-primary">➕ Adicionar</button>
                     </div>
                     <div id="add-result" class="alert" style="margin-top: 10px; display: none;"></div>
@@ -2641,12 +2791,30 @@ def dashboard():
                     <div style="overflow-x: auto;">
                         <table style="width:100%">
                             <thead>
-                                <tr><th>#</th><th>Jogador</th><th>Serviço</th><th>Jogo</th><th>Entrada</th><th>Ações</th></tr>
+                                <tr><th>#</th><th>Jogador</th><th>Serviço</th><th>Jogo</th><th>UID</th><th>Data</th><th>Ações</th></tr>
                             </thead>
-                            <tbody id="fila-tabela"><tr><td colspan="6">Carregando...</td></tr></tbody>
+                            <tbody id="fila-tabela"><tr><td colspan="7">Carregando...</td></tr></tbody>
                         </table>
                     </div>
                     <div style="margin-top: 10px;"><button onclick="atualizarFila()" class="btn btn-primary">🔄 Atualizar</button></div>
+                </div>
+                
+                <!-- HISTÓRICO DA FILA (COM BUSCA POR UID) -->
+                <div class="card historico-fila">
+                    <h2>📜 Histórico da Fila</h2>
+                    <div class="busca-uid">
+                        <input type="text" id="historico-filtro-uid" placeholder="Filtrar por UID..." oninput="filtrarHistorico()">
+                        <button onclick="filtrarHistorico()" class="btn btn-primary">🔍 Filtrar</button>
+                        <button onclick="document.getElementById('historico-filtro-uid').value=''; filtrarHistorico();" class="btn btn-secondary">Limpar</button>
+                    </div>
+                    <div style="overflow-x: auto;">
+                        <table style="width:100%">
+                            <thead>
+                                <tr><th>#</th><th>Jogador</th><th>Serviço</th><th>Jogo</th><th>UID</th><th>Status</th><th>Data</th></tr>
+                            </thead>
+                            <tbody id="historico-tabela"><tr><td colspan="7">Carregando...</td></tr></tbody>
+                        </table>
+                    </div>
                 </div>
             </div>
             
@@ -2691,9 +2859,7 @@ def dashboard():
                         💡 <strong>Recompensas:</strong> Os clientes podem trocar seus pontos por esses benefícios. 
                         Cada recompensa deve ter um nome, custo em pontos, tipo (serviço ou cupom) e, se for cupom, um valor de desconto.
                     </div>
-                    <div id="recompensas-lista" style="margin: 15px 0;">
-                        <!-- Lista dinâmica -->
-                    </div>
+                    <div id="recompensas-lista" style="margin: 15px 0;"></div>
                     <hr>
                     <h3>➕ Adicionar Nova Recompensa</h3>
                     <div class="grid-3">
@@ -2727,87 +2893,88 @@ def dashboard():
             let canais = [];
             let cargos = [];
             let membros = [];
-            let configAtual = {{}};
-            let botoesPrecos = {botoes_precos_json};
-            let recompensas = {recompensas_json};
+            let configAtual = {};
+            let botoesPrecos = {{ botoes_precos_json|safe }};
+            let recompensas = {{ recompensas_json|safe }};
+            let historicoCompleto = {{ historico_json|safe }};
             
             // ========== FUNÇÕES DE RECOMPENSAS ==========
-            function carregarRecompensas() {{
+            function carregarRecompensas() {
                 const container = document.getElementById('recompensas-lista');
                 if (!container) return;
-                if (recompensas.length === 0) {{
+                if (recompensas.length === 0) {
                     container.innerHTML = '<p>Nenhuma recompensa cadastrada.</p>';
                     return;
-                }}
+                }
                 let html = '';
-                recompensas.forEach((r, idx) => {{
+                recompensas.forEach((r, idx) => {
                     html += `
                         <div class="recompensa-item">
                             <div class="recompensa-info">
-                                <div class="recompensa-nome">${{escapeHtml(r.nome)}}</div>
-                                <div class="recompensa-detalhes">${{r.pontos}} pontos | Tipo: ${{r.tipo}} ${{r.tipo === 'cupom' ? '| Desconto: R$ '+r.desconto.toFixed(2) : ''}}</div>
+                                <div class="recompensa-nome">${escapeHtml(r.nome)}</div>
+                                <div class="recompensa-detalhes">${r.pontos} pontos | Tipo: ${r.tipo} ${r.tipo === 'cupom' ? '| Desconto: R$ '+r.desconto.toFixed(2) : ''}</div>
                             </div>
                             <div class="recompensa-acoes">
-                                <button onclick="editarRecompensa('${{r.id}}')" class="btn btn-primary btn-sm">✏️ Editar</button>
-                                <button onclick="removerRecompensa('${{r.id}}')" class="btn btn-danger btn-sm">🗑️ Remover</button>
+                                <button onclick="editarRecompensa('${r.id}')" class="btn btn-primary btn-sm">✏️ Editar</button>
+                                <button onclick="removerRecompensa('${r.id}')" class="btn btn-danger btn-sm">🗑️ Remover</button>
                             </div>
                         </div>
                     `;
-                }});
+                });
                 container.innerHTML = html;
-            }}
+            }
 
-            async function adicionarRecompensa() {{
+            async function adicionarRecompensa() {
                 const nome = document.getElementById('nova-rec-nome').value.trim();
                 const pontos = parseInt(document.getElementById('nova-rec-pontos').value);
                 const tipo = document.getElementById('nova-rec-tipo').value;
                 const desconto = parseFloat(document.getElementById('nova-rec-desconto').value) || 0;
 
-                if (!nome || isNaN(pontos) || pontos <= 0) {{
+                if (!nome || isNaN(pontos) || pontos <= 0) {
                     showAlert('rec-alert', 'Preencha nome e pontos corretamente.', false);
                     return;
-                }}
+                }
 
-                try {{
-                    const resp = await fetch('/api/fidelidade/recompensas', {{
+                try {
+                    const resp = await fetch('/api/fidelidade/recompensas', {
                         method: 'POST',
-                        headers: {{'Content-Type': 'application/json'}},
-                        body: JSON.stringify({{ nome, pontos, tipo, desconto }})
-                    }});
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ nome, pontos, tipo, desconto })
+                    });
                     const data = await resp.json();
-                    if (data.sucesso) {{
+                    if (data.sucesso) {
                         recompensas = await carregarRecompensasAPI();
                         carregarRecompensas();
                         document.getElementById('nova-rec-nome').value = '';
                         document.getElementById('nova-rec-pontos').value = '';
                         document.getElementById('nova-rec-desconto').value = '0';
                         showAlert('rec-alert', data.mensagem, true);
-                    }} else {{
+                    } else {
                         showAlert('rec-alert', data.mensagem, false);
-                    }}
-                }} catch(e) {{
+                    }
+                } catch(e) {
                     showAlert('rec-alert', 'Erro: ' + e.message, false);
-                }}
-            }}
+                }
+            }
 
-            async function removerRecompensa(id) {{
+            async function removerRecompensa(id) {
                 if (!confirm('Remover esta recompensa?')) return;
-                try {{
-                    const resp = await fetch(`/api/fidelidade/recompensas/${{id}}`, {{ method: 'DELETE' }});
+                try {
+                    const resp = await fetch(`/api/fidelidade/recompensas/${id}`, { method: 'DELETE' });
                     const data = await resp.json();
-                    if (data.sucesso) {{
+                    if (data.sucesso) {
                         recompensas = await carregarRecompensasAPI();
                         carregarRecompensas();
                         showAlert('rec-alert', data.mensagem, true);
-                    }} else {{
+                    } else {
                         showAlert('rec-alert', data.mensagem, false);
-                    }}
-                }} catch(e) {{
+                    }
+                } catch(e) {
                     showAlert('rec-alert', 'Erro: ' + e.message, false);
-                }}
-            }}
+                }
+            }
 
-            async function editarRecompensa(id) {{
+            async function editarRecompensa(id) {
                 const rec = recompensas.find(r => r.id === id);
                 if (!rec) return;
                 const novoNome = prompt('Novo nome:', rec.nome);
@@ -2817,38 +2984,89 @@ def dashboard():
                 const novoTipo = prompt('Novo tipo (servico ou cupom):', rec.tipo);
                 if (novoTipo === null) return;
                 let novoDesconto = rec.desconto;
-                if (novoTipo === 'cupom') {{
+                if (novoTipo === 'cupom') {
                     novoDesconto = parseFloat(prompt('Novo desconto (R$):', rec.desconto)) || 0;
-                }}
-                try {{
-                    const resp = await fetch(`/api/fidelidade/recompensas/${{id}}`, {{
+                }
+                try {
+                    const resp = await fetch(`/api/fidelidade/recompensas/${id}`, {
                         method: 'PUT',
-                        headers: {{'Content-Type': 'application/json'}},
-                        body: JSON.stringify({{ nome: novoNome, pontos: novosPontos, tipo: novoTipo, desconto: novoDesconto }})
-                    }});
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ nome: novoNome, pontos: novosPontos, tipo: novoTipo, desconto: novoDesconto })
+                    });
                     const data = await resp.json();
-                    if (data.sucesso) {{
+                    if (data.sucesso) {
                         recompensas = await carregarRecompensasAPI();
                         carregarRecompensas();
                         showAlert('rec-alert', data.mensagem, true);
-                    }} else {{
+                    } else {
                         showAlert('rec-alert', data.mensagem, false);
-                    }}
-                }} catch(e) {{
+                    }
+                } catch(e) {
                     showAlert('rec-alert', 'Erro: ' + e.message, false);
-                }}
-            }}
+                }
+            }
 
-            async function carregarRecompensasAPI() {{
+            async function carregarRecompensasAPI() {
                 const resp = await fetch('/api/fidelidade/recompensas');
                 const data = await resp.json();
                 if (data.sucesso) return data.recompensas;
                 return [];
-            }}
+            }
+
+            // ========== FUNÇÕES DE HISTÓRICO DA FILA ==========
+            function renderizarHistorico(historico) {
+                const tbody = document.getElementById('historico-tabela');
+                if (!historico || historico.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="7">Nenhum registro no histórico.</td></tr>';
+                    return;
+                }
+                let html = '';
+                historico.forEach((e, idx) => {
+                    const dataStr = e.concluido_em || e.removido_em || e.limpo_em || e.timestamp || '';
+                    const dataFormatada = dataStr ? new Date(dataStr).toLocaleDateString('pt-BR') : '-';
+                    const status = e.status || 'concluido';
+                    const uid = e.uid || e.usuario_id || '';
+                    html += `
+                        <tr>
+                            <td>${idx + 1}</td>
+                            <td>${escapeHtml(e.nome_usuario || '')}</td>
+                            <td>${escapeHtml(e.servico || '')}</td>
+                            <td>${escapeHtml(e.jogo || '')}</td>
+                            <td>${escapeHtml(uid)}</td>
+                            <td>${status}</td>
+                            <td>${dataFormatada}</td>
+                        </tr>
+                    `;
+                });
+                tbody.innerHTML = html;
+            }
+
+            function filtrarHistorico() {
+                const filtro = document.getElementById('historico-filtro-uid').value.trim().toLowerCase();
+                if (!filtro) {
+                    renderizarHistorico(historicoCompleto);
+                    return;
+                }
+                const filtrados = historicoCompleto.filter(e => {
+                    const uid = (e.uid || e.usuario_id || '').toString().toLowerCase();
+                    return uid.includes(filtro);
+                });
+                renderizarHistorico(filtrados);
+            }
 
             // ========== FUNÇÕES EXISTENTES ==========
-            async function carregarDados() {{
-                try {{
+            function showTab(event, tabId) {
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+                document.getElementById(tabId).classList.add('active');
+                event.currentTarget.classList.add('active');
+                if (tabId === 'fila') carregarFila();
+                if (tabId === 'moderacao') carregarAdvertencias();
+                if (tabId === 'recompensas') carregarRecompensas();
+            }
+
+            async function carregarDados() {
+                try {
                     const [canaisRes, cargosRes, membrosRes, configBoasVindas, configXP, linksRes, antiSpamRes, configComandosRes, filaConfigRes] = await Promise.all([
                         fetch('/api/servidor/canais'),
                         fetch('/api/servidor/cargos'),
@@ -2877,45 +3095,45 @@ def dashboard():
                     
                     popularSelects();
                     
-                    if (configBV.sucesso) {{
+                    if (configBV.sucesso) {
                         document.getElementById('welcome-mensagem').value = configBV.mensagem || '';
                         document.getElementById('welcome-imagem').value = configBV.imagem || '';
                         const welcomeCanal = document.getElementById('welcome-canal');
                         if (welcomeCanal) welcomeCanal.value = configBV.canal || '';
-                    }}
+                    }
                     
-                    if (configXPdata.sucesso) {{
+                    if (configXPdata.sucesso) {
                         document.getElementById('xp-taxa').value = configXPdata.taxa || 3;
                         const xpCanal = document.getElementById('xp-canal');
                         if (xpCanal) xpCanal.value = configXPdata.canal || '';
-                    }}
+                    }
                     
-                    if (configComandosData.sucesso) {{
+                    if (configComandosData.sucesso) {
                         configAtual = configComandosData;
                         const canalPerfil = document.getElementById('canal-perfil');
                         const canalRank = document.getElementById('canal-rank');
-                        if (canalPerfil) {{
+                        if (canalPerfil) {
                             canalPerfil.value = configComandosData.canal_perfil || '';
                             atualizarStatusPerfil(configComandosData.canal_perfil);
-                        }}
-                        if (canalRank) {{
+                        }
+                        if (canalRank) {
                             canalRank.value = configComandosData.canal_rank || '';
                             atualizarStatusRank(configComandosData.canal_rank);
-                        }}
-                    }}
+                        }
+                    }
                     
-                    if (linksData.sucesso && linksData.canais) {{
+                    if (linksData.sucesso && linksData.canais) {
                         const linksStatus = document.getElementById('links-status');
-                        if (linksStatus) {{
-                            const nomes = linksData.canais.map(c => {{
+                        if (linksStatus) {
+                            const nomes = linksData.canais.map(c => {
                                 const canal = canais.find(ca => ca.id == c);
                                 return canal ? '#' + canal.nome : c;
-                            }}).join(', ');
+                            }).join(', ');
                             linksStatus.innerHTML = nomes ? 'Canais bloqueados: ' + nomes : 'Nenhum canal bloqueado';
-                        }}
-                    }}
+                        }
+                    }
                     
-                    if (antiSpamData.sucesso && antiSpamData.config) {{
+                    if (antiSpamData.sucesso && antiSpamData.config) {
                         document.getElementById('as-ativado').checked = antiSpamData.config.ativado;
                         document.getElementById('as-remover-xp').checked = antiSpamData.config.remover_xp;
                         document.getElementById('as-deletar').checked = antiSpamData.config.deletar_mensagens;
@@ -2928,207 +3146,203 @@ def dashboard():
                         
                         const listaDiv = document.getElementById('lista-comandos');
                         const comandos = antiSpamData.config.comandos_ignorados.split(',');
-                        listaDiv.innerHTML = comandos.map(c => `<span style="background:#333; padding:4px 12px; border-radius:20px;">${{c.trim()}}</span>`).join('');
-                    }}
+                        listaDiv.innerHTML = comandos.map(c => `<span style="background:#333; padding:4px 12px; border-radius:20px;">${c.trim()}</span>`).join('');
+                    }
                     
-                    if (filaConfig.sucesso && filaConfig.links) {{
-                        document.getElementById('link-discord').value = filaConfig.links.discord_convite || '';
-                        if (filaConfig.links.botoes_precos) {{
-                            botoesPrecos = filaConfig.links.botoes_precos;
-                        }}
-                    }}
+                    if (filaConfig.sucesso) {
+                        if (filaConfig.links) {
+                            document.getElementById('link-discord').value = filaConfig.links.discord_convite || '';
+                            if (filaConfig.links.botoes_precos) {
+                                botoesPrecos = filaConfig.links.botoes_precos;
+                            }
+                        }
+                        if (filaConfig.pix_link) {
+                            document.getElementById('pix-link').value = filaConfig.pix_link;
+                        }
+                    }
                     
                     carregarCargosNivel();
                     carregarFila();
                     carregarBotoesPrecos();
                     carregarRecompensas();
-                }} catch(e) {{ console.error(e); }}
-            }}
+                    renderizarHistorico(historicoCompleto);
+                } catch(e) { console.error(e); }
+            }
             
-            function carregarBotoesPrecos() {{
+            function carregarBotoesPrecos() {
                 const container = document.getElementById('botoes-precos-lista');
                 if (!container) return;
                 
-                if (botoesPrecos.length === 0) {{
+                if (botoesPrecos.length === 0) {
                     container.innerHTML = '<div style="text-align:center;padding:20px;color:#888;">Nenhum botão de preço configurado. Adicione um acima!</div>';
                     return;
-                }}
+                }
                 
                 let html = '';
-                botoesPrecos.forEach((botao, index) => {{
+                botoesPrecos.forEach((botao, index) => {
                     html += `
                         <div class="botao-item">
                             <div class="botao-info">
-                                <div class="botao-nome">💰 ${{escapeHtml(botao.nome)}}</div>
-                                <div class="botao-url">${{escapeHtml(botao.url)}}</div>
+                                <div class="botao-nome">💰 ${escapeHtml(botao.nome)}</div>
+                                <div class="botao-url">${escapeHtml(botao.url)}</div>
                             </div>
                             <div class="botao-acoes">
-                                <button onclick="editarBotaoPreco(${{index}})" class="btn btn-primary btn-sm">✏️ Editar</button>
-                                <button onclick="removerBotaoPreco(${{index}})" class="btn btn-danger btn-sm">🗑️ Remover</button>
+                                <button onclick="editarBotaoPreco(${index})" class="btn btn-primary btn-sm">✏️ Editar</button>
+                                <button onclick="removerBotaoPreco(${index})" class="btn btn-danger btn-sm">🗑️ Remover</button>
                             </div>
                         </div>
                     `;
-                }});
+                });
                 container.innerHTML = html;
-            }}
+            }
             
-            async function adicionarBotaoPreco() {{
+            async function adicionarBotaoPreco() {
                 const nome = document.getElementById('novo-botao-nome').value.trim();
                 const url = document.getElementById('novo-botao-url').value.trim();
                 
-                if (!nome || !url) {{
+                if (!nome || !url) {
                     showAlert('fila-status', 'Preencha nome e URL do botão', false);
                     return;
-                }}
+                }
                 
-                try {{
-                    const resp = await fetch('/api/fila/botoes/adicionar', {{
+                try {
+                    const resp = await fetch('/api/fila/botoes/adicionar', {
                         method: 'POST',
-                        headers: {{'Content-Type': 'application/json'}},
-                        body: JSON.stringify({{nome, url}})
-                    }});
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({nome, url})
+                    });
                     const result = await resp.json();
-                    if (result.sucesso) {{
+                    if (result.sucesso) {
                         document.getElementById('novo-botao-nome').value = '';
                         document.getElementById('novo-botao-url').value = '';
                         await carregarBotoesNovamente();
                         showAlert('fila-status', result.mensagem, true);
-                    }} else {{
+                    } else {
                         showAlert('fila-status', result.mensagem, false);
-                    }}
-                }} catch(e) {{
+                    }
+                } catch(e) {
                     showAlert('fila-status', 'Erro: ' + e.message, false);
-                }}
-            }}
+                }
+            }
             
-            async function carregarBotoesNovamente() {{
-                try {{
+            async function carregarBotoesNovamente() {
+                try {
                     const resp = await fetch('/api/fila/botoes');
                     const data = await resp.json();
-                    if (data.sucesso) {{
+                    if (data.sucesso) {
                         botoesPrecos = data.botoes;
                         carregarBotoesPrecos();
-                    }}
-                }} catch(e) {{
+                    }
+                } catch(e) {
                     console.error(e);
-                }}
-            }}
+                }
+            }
             
-            async function removerBotaoPreco(index) {{
+            async function removerBotaoPreco(index) {
                 if (!confirm('Remover este botão?')) return;
-                try {{
-                    const resp = await fetch('/api/fila/botoes/remover', {{
+                try {
+                    const resp = await fetch('/api/fila/botoes/remover', {
                         method: 'POST',
-                        headers: {{'Content-Type': 'application/json'}},
-                        body: JSON.stringify({{index}})
-                    }});
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({index})
+                    });
                     const result = await resp.json();
-                    if (result.sucesso) {{
+                    if (result.sucesso) {
                         await carregarBotoesNovamente();
                         showAlert('fila-status', result.mensagem, true);
-                    }} else {{
+                    } else {
                         showAlert('fila-status', result.mensagem, false);
-                    }}
-                }} catch(e) {{
+                    }
+                } catch(e) {
                     showAlert('fila-status', 'Erro: ' + e.message, false);
-                }}
-            }}
+                }
+            }
             
-            function editarBotaoPreco(index) {{
+            function editarBotaoPreco(index) {
                 const botao = botoesPrecos[index];
                 const novoNome = prompt('Digite o novo nome do botão:', botao.nome);
                 if (!novoNome) return;
                 const novaUrl = prompt('Digite a nova URL:', botao.url);
                 if (!novaUrl) return;
                 
-                fetch('/api/fila/botoes/atualizar', {{
+                fetch('/api/fila/botoes/atualizar', {
                     method: 'POST',
-                    headers: {{'Content-Type': 'application/json'}},
-                    body: JSON.stringify({{index, nome: novoNome, url: novaUrl}})
-                }}).then(async (resp) => {{
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({index, nome: novoNome, url: novaUrl})
+                }).then(async (resp) => {
                     const result = await resp.json();
-                    if (result.sucesso) {{
+                    if (result.sucesso) {
                         await carregarBotoesNovamente();
                         showAlert('fila-status', result.mensagem, true);
-                    }} else {{
+                    } else {
                         showAlert('fila-status', result.mensagem, false);
-                    }}
-                }}).catch(e => showAlert('fila-status', 'Erro: ' + e.message, false));
-            }}
+                    }
+                }).catch(e => showAlert('fila-status', 'Erro: ' + e.message, false));
+            }
             
-            function atualizarStatusPerfil(canalId) {{
+            function atualizarStatusPerfil(canalId) {
                 const div = document.getElementById('perfil-status');
-                if (!canalId) {{
+                if (!canalId) {
                     div.innerHTML = '<span class="config-badge" style="background:#00b894;">🔓 Funciona em TODOS os canais</span>';
-                }} else {{
+                } else {
                     const canal = canais.find(c => c.id == canalId);
-                    div.innerHTML = `<span class="config-badge">📢 /perfil funciona apenas em <strong>#${{canal ? canal.nome : canalId}}</strong></span> <span style="color:#ffd93d;">(Clique novamente para remover)</span>`;
-                }}
-            }}
+                    div.innerHTML = `<span class="config-badge">📢 /perfil funciona apenas em <strong>#${canal ? canal.nome : canalId}</strong></span> <span style="color:#ffd93d;">(Clique novamente para remover)</span>`;
+                }
+            }
             
-            function atualizarStatusRank(canalId) {{
+            function atualizarStatusRank(canalId) {
                 const div = document.getElementById('rank-status');
-                if (!canalId) {{
+                if (!canalId) {
                     div.innerHTML = '<span class="config-badge" style="background:#00b894;">🔓 Funciona em TODOS os canais</span>';
-                }} else {{
+                } else {
                     const canal = canais.find(c => c.id == canalId);
-                    div.innerHTML = `<span class="config-badge">📢 /rank funciona apenas em <strong>#${{canal ? canal.nome : canalId}}</strong></span> <span style="color:#ffd93d;">(Clique novamente para remover)</span>`;
-                }}
-            }}
+                    div.innerHTML = `<span class="config-badge">📢 /rank funciona apenas em <strong>#${canal ? canal.nome : canalId}</strong></span> <span style="color:#ffd93d;">(Clique novamente para remover)</span>`;
+                }
+            }
             
-            function popularSelects() {{
+            function popularSelects() {
                 const selects = ['welcome-canal', 'xp-canal', 'rr-canal', 'btn-canal', 'embed-canal', 'links-canal', 'canal-perfil', 'canal-rank'];
-                selects.forEach(id => {{
+                selects.forEach(id => {
                     const select = document.getElementById(id);
-                    if (select) {{
+                    if (select) {
                         select.innerHTML = '<option value="">🔓 Todos os canais</option>';
-                        canais.forEach(c => {{
+                        canais.forEach(c => {
                             const option = document.createElement('option');
                             option.value = c.id;
                             option.textContent = '#' + c.nome;
                             select.appendChild(option);
-                        }});
-                    }}
-                }});
+                        });
+                    }
+                });
                 
                 const cargoSelect = document.getElementById('novo-cargo');
-                if (cargoSelect) {{
+                if (cargoSelect) {
                     cargoSelect.innerHTML = '<option value="">Selecione um cargo</option>';
-                    cargos.forEach(c => {{
+                    cargos.forEach(c => {
                         const option = document.createElement('option');
                         option.value = c.id;
                         option.textContent = c.nome;
                         cargoSelect.appendChild(option);
-                    }});
-                }}
+                    });
+                }
                 
                 const membroSelects = ['warn-membro', 'ver-warns'];
-                membroSelects.forEach(id => {{
+                membroSelects.forEach(id => {
                     const select = document.getElementById(id);
-                    if (select) {{
+                    if (select) {
                         select.innerHTML = '<option value="">Selecione um membro</option>';
-                        membros.forEach(m => {{
+                        membros.forEach(m => {
                             const option = document.createElement('option');
                             option.value = m.id;
                             option.textContent = m.nome;
                             select.appendChild(option);
-                        }});
-                    }}
-                }});
-            }}
+                        });
+                    }
+                });
+            }
             
-            function showTab(tabId) {{
-                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-                document.getElementById(tabId).classList.add('active');
-                event.target.classList.add('active');
-                if (tabId === 'fila') carregarFila();
-                if (tabId === 'moderacao') carregarAdvertencias();
-                if (tabId === 'recompensas') carregarRecompensas();
-            }}
-            
-            async function salvarAntiSpam() {{
-                const data = {{
+            async function salvarAntiSpam() {
+                const data = {
                     ativado: document.getElementById('as-ativado').checked,
                     remover_xp: document.getElementById('as-remover-xp').checked,
                     deletar_mensagens: document.getElementById('as-deletar').checked,
@@ -3138,368 +3352,379 @@ def dashboard():
                     xp_penalidade: parseInt(document.getElementById('as-xp-penalidade').value),
                     cargos_ignorados: document.getElementById('as-cargos').value,
                     comandos_ignorados: document.getElementById('as-comandos').value
-                }};
-                try {{
-                    const resp = await fetch('/api/anti_spam', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify(data)}});
+                };
+                try {
+                    const resp = await fetch('/api/anti_spam', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data)});
                     const result = await resp.json();
                     showAlert('as-alert', result.mensagem, result.sucesso);
-                    if (result.sucesso) {{
+                    if (result.sucesso) {
                         const comandos = data.comandos_ignorados.split(',');
-                        document.getElementById('lista-comandos').innerHTML = comandos.map(c => `<span style="background:#333; padding:4px 12px; border-radius:20px;">${{c.trim()}}</span>`).join('');
-                    }}
-                }} catch(e) {{ showAlert('as-alert', 'Erro: ' + e.message, false); }}
-            }}
+                        document.getElementById('lista-comandos').innerHTML = comandos.map(c => `<span style="background:#333; padding:4px 12px; border-radius:20px;">${c.trim()}</span>`).join('');
+                    }
+                } catch(e) { showAlert('as-alert', 'Erro: ' + e.message, false); }
+            }
             
-            async function salvarBoasVindas() {{
-                const data = {{
+            async function salvarBoasVindas() {
+                const data = {
                     canal_id: document.getElementById('welcome-canal').value,
                     mensagem: document.getElementById('welcome-mensagem').value,
                     imagem_url: document.getElementById('welcome-imagem').value
-                }};
-                try {{
-                    const resp = await fetch('/api/config/boasvindas', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify(data)}});
+                };
+                try {
+                    const resp = await fetch('/api/config/boasvindas', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data)});
                     const result = await resp.json();
                     showAlert('welcome-alert', result.mensagem, result.sucesso);
-                }} catch(e) {{ showAlert('welcome-alert', 'Erro: ' + e.message, false); }}
-            }}
+                } catch(e) { showAlert('welcome-alert', 'Erro: ' + e.message, false); }
+            }
             
-            async function salvarXP() {{
-                const data = {{ taxa: parseInt(document.getElementById('xp-taxa').value), canal_id: document.getElementById('xp-canal').value }};
-                try {{
-                    const resp = await fetch('/api/config/xp', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify(data)}});
+            async function salvarXP() {
+                const data = { taxa: parseInt(document.getElementById('xp-taxa').value), canal_id: document.getElementById('xp-canal').value };
+                try {
+                    const resp = await fetch('/api/config/xp', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data)});
                     const result = await resp.json();
                     showAlert('xp-alert', result.mensagem, result.sucesso);
-                }} catch(e) {{ showAlert('xp-alert', 'Erro: ' + e.message, false); }}
-            }}
+                } catch(e) { showAlert('xp-alert', 'Erro: ' + e.message, false); }
+            }
             
-            async function salvarConfigComandos() {{
+            async function salvarConfigComandos() {
                 const canalPerfil = document.getElementById('canal-perfil').value;
                 const canalRank = document.getElementById('canal-rank').value;
                 
                 let perfilFinal = canalPerfil;
                 let rankFinal = canalRank;
                 
-                if (canalPerfil && configAtual.canal_perfil === canalPerfil) {{
+                if (canalPerfil && configAtual.canal_perfil === canalPerfil) {
                     perfilFinal = '';
-                }}
-                if (canalRank && configAtual.canal_rank === canalRank) {{
+                }
+                if (canalRank && configAtual.canal_rank === canalRank) {
                     rankFinal = '';
-                }}
+                }
                 
-                const data = {{
+                const data = {
                     canal_perfil: perfilFinal,
                     canal_rank: rankFinal
-                }};
-                try {{
-                    const resp = await fetch('/api/config/comandos', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify(data)}});
+                };
+                try {
+                    const resp = await fetch('/api/config/comandos', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data)});
                     const result = await resp.json();
                     showAlert('comandos-alert', result.mensagem, result.sucesso);
-                    if (result.sucesso) {{
-                        if (perfilFinal !== canalPerfil) {{
+                    if (result.sucesso) {
+                        if (perfilFinal !== canalPerfil) {
                             document.getElementById('canal-perfil').value = '';
                             atualizarStatusPerfil('');
                             configAtual.canal_perfil = '';
-                        }} else {{
+                        } else {
                             atualizarStatusPerfil(perfilFinal);
                             configAtual.canal_perfil = perfilFinal;
-                        }}
-                        if (rankFinal !== canalRank) {{
+                        }
+                        if (rankFinal !== canalRank) {
                             document.getElementById('canal-rank').value = '';
                             atualizarStatusRank('');
                             configAtual.canal_rank = '';
-                        }} else {{
+                        } else {
                             atualizarStatusRank(rankFinal);
                             configAtual.canal_rank = rankFinal;
-                        }}
-                    }}
-                }} catch(e) {{ showAlert('comandos-alert', 'Erro: ' + e.message, false); }}
-            }}
+                        }
+                    }
+                } catch(e) { showAlert('comandos-alert', 'Erro: ' + e.message, false); }
+            }
             
-            async function carregarCargosNivel() {{
-                try {{
+            async function carregarCargosNivel() {
+                try {
                     const resp = await fetch('/api/cargos/nivel');
                     const data = await resp.json();
                     const container = document.getElementById('cargos-nivel-lista');
-                    if (data.sucesso && Object.keys(data.cargos).length > 0) {{
+                    if (data.sucesso && Object.keys(data.cargos).length > 0) {
                         let html = '<div style="display: flex; flex-wrap: wrap; gap: 0.5rem;">';
-                        for (const [nivel, cargoId] of Object.entries(data.cargos)) {{
+                        for (const [nivel, cargoId] of Object.entries(data.cargos)) {
                             const cargo = cargos.find(c => c.id == cargoId);
-                            html += `<div style="background: #333; padding: 0.5rem 1rem; border-radius: 5px;">Nível ${{nivel}}: ${{cargo ? cargo.nome : 'Cargo não encontrado'}} <button onclick="removerCargoNivel(${{nivel}})" style="background:#dc3545;color:white;border:none;border-radius:3px;padding:0.25rem 0.5rem;cursor:pointer;">×</button></div>`;
-                        }}
+                            html += `<div style="background: #333; padding: 0.5rem 1rem; border-radius: 5px;">Nível ${nivel}: ${cargo ? cargo.nome : 'Cargo não encontrado'} <button onclick="removerCargoNivel(${nivel})" style="background:#dc3545;color:white;border:none;border-radius:3px;padding:0.25rem 0.5rem;cursor:pointer;">×</button></div>`;
+                        }
                         html += '</div>';
                         container.innerHTML = html;
-                    }} else {{
+                    } else {
                         container.innerHTML = '<p>Nenhum cargo por nível configurado.</p>';
-                    }}
-                }} catch(e) {{ console.error(e); }}
-            }}
+                    }
+                } catch(e) { console.error(e); }
+            }
             
-            async function adicionarCargoNivel() {{
+            async function adicionarCargoNivel() {
                 const nivel = document.getElementById('novo-nivel').value;
                 const cargoId = document.getElementById('novo-cargo').value;
-                if (!nivel || !cargoId) {{
+                if (!nivel || !cargoId) {
                     showAlert('xp-alert', 'Preencha nível e cargo', false);
                     return;
-                }}
-                try {{
-                    const resp = await fetch('/api/cargos/nivel', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{nivel, cargo_id: cargoId}})}});
+                }
+                try {
+                    const resp = await fetch('/api/cargos/nivel', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({nivel, cargo_id: cargoId})});
                     const result = await resp.json();
                     showAlert('xp-alert', result.mensagem, result.sucesso);
-                    if (result.sucesso) {{
+                    if (result.sucesso) {
                         document.getElementById('novo-nivel').value = '';
                         carregarCargosNivel();
-                    }}
-                }} catch(e) {{ showAlert('xp-alert', 'Erro: ' + e.message, false); }}
-            }}
+                    }
+                } catch(e) { showAlert('xp-alert', 'Erro: ' + e.message, false); }
+            }
             
-            async function removerCargoNivel(nivel) {{
+            async function removerCargoNivel(nivel) {
                 if (!confirm('Remover cargo do nível ' + nivel + '?')) return;
-                try {{
-                    const resp = await fetch(`/api/cargos/nivel?nivel=${{nivel}}`, {{method: 'DELETE'}});
+                try {
+                    const resp = await fetch(`/api/cargos/nivel?nivel=${nivel}`, {method: 'DELETE'});
                     const result = await resp.json();
                     showAlert('xp-alert', result.mensagem, result.sucesso);
                     if (result.sucesso) carregarCargosNivel();
-                }} catch(e) {{ showAlert('xp-alert', 'Erro: ' + e.message, false); }}
-            }}
+                } catch(e) { showAlert('xp-alert', 'Erro: ' + e.message, false); }
+            }
             
-            async function criarReacaoCargo() {{
-                const data = {{
+            async function criarReacaoCargo() {
+                const data = {
                     canal_id: document.getElementById('rr-canal').value,
                     conteudo: document.getElementById('rr-conteudo').value,
                     emoji_cargo: document.getElementById('rr-pares').value
-                }};
-                if (!data.canal_id || !data.conteudo || !data.emoji_cargo) {{
+                };
+                if (!data.canal_id || !data.conteudo || !data.emoji_cargo) {
                     showAlert('rr-alert', 'Preencha todos os campos', false);
                     return;
-                }}
-                try {{
-                    const resp = await fetch('/api/reacao_cargo/criar', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify(data)}});
+                }
+                try {
+                    const resp = await fetch('/api/reacao_cargo/criar', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data)});
                     const result = await resp.json();
                     showAlert('rr-alert', result.mensagem, result.sucesso);
-                    if (result.sucesso) {{
+                    if (result.sucesso) {
                         document.getElementById('rr-conteudo').value = '';
                         document.getElementById('rr-pares').value = '';
-                    }}
-                }} catch(e) {{ showAlert('rr-alert', 'Erro: ' + e.message, false); }}
-            }}
+                    }
+                } catch(e) { showAlert('rr-alert', 'Erro: ' + e.message, false); }
+            }
             
-            async function criarBotoesCargo() {{
-                const data = {{
+            async function criarBotoesCargo() {
+                const data = {
                     canal_id: document.getElementById('btn-canal').value,
                     conteudo: document.getElementById('btn-conteudo').value,
                     cargos: document.getElementById('btn-pares').value
-                }};
-                if (!data.canal_id || !data.conteudo || !data.cargos) {{
+                };
+                if (!data.canal_id || !data.conteudo || !data.cargos) {
                     showAlert('btn-alert', 'Preencha todos os campos', false);
                     return;
-                }}
-                try {{
-                    const resp = await fetch('/api/botoes_cargo/criar', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify(data)}});
+                }
+                try {
+                    const resp = await fetch('/api/botoes_cargo/criar', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data)});
                     const result = await resp.json();
                     showAlert('btn-alert', result.mensagem, result.sucesso);
-                    if (result.sucesso) {{
+                    if (result.sucesso) {
                         document.getElementById('btn-conteudo').value = '';
                         document.getElementById('btn-pares').value = '';
-                    }}
-                }} catch(e) {{ showAlert('btn-alert', 'Erro: ' + e.message, false); }}
-            }}
+                    }
+                } catch(e) { showAlert('btn-alert', 'Erro: ' + e.message, false); }
+            }
             
-            async function aplicarAdvertencia() {{
+            async function aplicarAdvertencia() {
                 const membroId = document.getElementById('warn-membro').value;
                 const motivo = document.getElementById('warn-motivo').value;
-                if (!membroId || !motivo) {{
+                if (!membroId || !motivo) {
                     alert('Selecione um membro e digite um motivo');
                     return;
-                }}
-                try {{
-                    const resp = await fetch('/api/comando/advertir', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{membro_id: membroId, motivo}})}});
+                }
+                try {
+                    const resp = await fetch('/api/comando/advertir', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({membro_id: membroId, motivo})});
                     const result = await resp.json();
                     alert(result.mensagem);
                     if (result.sucesso) document.getElementById('warn-motivo').value = '';
-                }} catch(e) {{ alert('Erro: ' + e.message); }}
-            }}
+                } catch(e) { alert('Erro: ' + e.message); }
+            }
             
-            async function limparAdvertencias() {{
+            async function limparAdvertencias() {
                 const membroId = document.getElementById('warn-membro').value;
-                if (!membroId) {{ alert('Selecione um membro'); return; }}
+                if (!membroId) { alert('Selecione um membro'); return; }
                 if (!confirm('Tem certeza?')) return;
-                try {{
-                    const resp = await fetch('/api/comando/limpar_advertencias', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{membro_id: membroId}})}});
+                try {
+                    const resp = await fetch('/api/comando/limpar_advertencias', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({membro_id: membroId})});
                     const result = await resp.json();
                     alert(result.mensagem);
-                }} catch(e) {{ alert('Erro: ' + e.message); }}
-            }}
+                } catch(e) { alert('Erro: ' + e.message); }
+            }
             
-            async function carregarAdvertencias() {{
+            async function carregarAdvertencias() {
                 const membroId = document.getElementById('ver-warns').value;
-                if (!membroId) {{
+                if (!membroId) {
                     document.getElementById('lista-warns').innerHTML = '<p>Selecione um membro</p>';
                     return;
-                }}
-                try {{
-                    const resp = await fetch(`/api/membro/advertencias?membro_id=${{membroId}}`);
+                }
+                try {
+                    const resp = await fetch(`/api/membro/advertencias?membro_id=${membroId}`);
                     const data = await resp.json();
-                    if (data.sucesso && data.advertencias.length > 0) {{
+                    if (data.sucesso && data.advertencias.length > 0) {
                         let html = '<h4>Advertências:</h4><ul>';
-                        data.advertencias.forEach(w => {{
-                            html += `<li><strong>${{w.motivo}}</strong> - ${{w.ts}} (por ${{w.admin || w.por}})</li>`;
-                        }});
+                        data.advertencias.forEach(w => {
+                            html += `<li><strong>${w.motivo}</strong> - ${w.ts} (por ${w.admin || w.por})</li>`;
+                        });
                         html += '</ul>';
                         document.getElementById('lista-warns').innerHTML = html;
-                    }} else {{
+                    } else {
                         document.getElementById('lista-warns').innerHTML = '<p>Nenhuma advertência encontrada.</p>';
-                    }}
-                }} catch(e) {{ console.error(e); }}
-            }}
+                    }
+                } catch(e) { console.error(e); }
+            }
             
-            async function alternarBloqueioLinks() {{
+            async function alternarBloqueioLinks() {
                 const canalId = document.getElementById('links-canal').value;
-                if (!canalId) {{ 
+                if (!canalId) { 
                     showAlert('links-alert', 'Selecione um canal', false);
                     return; 
-                }}
-                try {{
-                    const resp = await fetch('/api/config/links', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{canal_id: canalId}})}});
+                }
+                try {
+                    const resp = await fetch('/api/config/links', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({canal_id: canalId})});
                     const result = await resp.json();
-                    if (result.sucesso) {{
+                    if (result.sucesso) {
                         const linksRes = await fetch('/api/config/links');
                         const linksData = await linksRes.json();
-                        const nomes = linksData.canais.map(c => {{
+                        const nomes = linksData.canais.map(c => {
                             const canal = canais.find(ca => ca.id == c);
                             return canal ? '#' + canal.nome : c;
-                        }}).join(', ');
+                        }).join(', ');
                         document.getElementById('links-status').innerHTML = nomes ? 'Canais bloqueados: ' + nomes : 'Nenhum canal bloqueado';
                         showAlert('links-alert', result.mensagem, true);
-                    }} else {{
+                    } else {
                         showAlert('links-alert', 'Erro ao alternar bloqueio', false);
-                    }}
-                }} catch(e) {{ 
+                    }
+                } catch(e) { 
                     showAlert('links-alert', 'Erro: ' + e.message, false);
-                }}
-            }}
+                }
+            }
             
-            async function criarEmbed() {{
-                const data = {{
+            async function criarEmbed() {
+                const data = {
                     canal_id: document.getElementById('embed-canal').value,
                     titulo: document.getElementById('embed-titulo').value,
                     corpo: document.getElementById('embed-corpo').value,
                     cor: document.getElementById('embed-cor').value,
                     url_imagem: document.getElementById('embed-imagem').value,
                     mencao: document.getElementById('embed-mencao').value
-                }};
-                if (!data.canal_id || !data.titulo || !data.corpo) {{
+                };
+                if (!data.canal_id || !data.titulo || !data.corpo) {
                     alert('Preencha canal, título e corpo');
                     return;
-                }}
-                try {{
-                    const resp = await fetch('/api/comando/embed', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify(data)}});
+                }
+                try {
+                    const resp = await fetch('/api/comando/embed', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data)});
                     const result = await resp.json();
                     showAlert('embed-alert', result.mensagem, result.sucesso);
-                    if (result.sucesso) {{
+                    if (result.sucesso) {
                         document.getElementById('embed-titulo').value = '';
                         document.getElementById('embed-corpo').value = '';
                         document.getElementById('embed-imagem').value = '';
-                    }}
-                }} catch(e) {{ showAlert('embed-alert', 'Erro: ' + e.message, false); }}
-            }}
+                    }
+                } catch(e) { showAlert('embed-alert', 'Erro: ' + e.message, false); }
+            }
             
-            // Funções da Fila
-            async function carregarFila() {{
-                try {{
+            // ========== FUNÇÕES DA FILA (COM ATUALIZAÇÃO DO HISTÓRICO) ==========
+            async function carregarFila() {
+                try {
                     const resp = await fetch('/fila/api');
                     const data = await resp.json();
-                    if (data.sucesso) {{
+                    if (data.sucesso) {
                         const fila = data.fila;
                         const tbody = document.getElementById('fila-tabela');
-                        if (fila.entradas.length === 0) {{
-                            tbody.innerHTML = '<tr><td colspan="6">📭 Ninguém na fila</td></tr>';
-                        }} else {{
-                            tbody.innerHTML = fila.entradas.map(e => `
-                                <tr>
-                                    <td><strong style="color:#ffd93d;">#${{e.posicao}}</strong></td>
-                                    <td>${{escapeHtml(e.nome_usuario)}}</td>
-                                    <td style="color:#a8e6cf;">${{escapeHtml(e.servico)}}</td>
-                                    <td style="color:#ffb347;">${{escapeHtml(e.jogo || '')}}</td>
-                                    <td>${{new Date(e.timestamp).toLocaleTimeString()}}</td>
-                                    <td>
-                                        <button onclick="moverCima('${{e.id}}')" class="btn btn-primary btn-sm">⬆️</button>
-                                        <button onclick="moverBaixo('${{e.id}}')" class="btn btn-primary btn-sm">⬇️</button>
-                                        <button onclick="concluir('${{e.id}}')" class="btn btn-success btn-sm">✅</button>
-                                        <button onclick="remover('${{e.id}}')" class="btn btn-danger btn-sm">❌</button>
-                                    </td>
-                                </tr>
-                            `).join('');
-                        }}
+                        if (fila.entradas.length === 0) {
+                            tbody.innerHTML = '<tr><td colspan="7">📭 Ninguém na fila</td></tr>';
+                        } else {
+                            tbody.innerHTML = fila.entradas.map(e => {
+                                const dataFormatada = new Date(e.timestamp).toLocaleDateString('pt-BR');
+                                return `
+                                    <tr>
+                                        <td><strong style="color:#ffd93d;">#${e.posicao}</strong></td>
+                                        <td>${escapeHtml(e.nome_usuario)}</td>
+                                        <td style="color:#a8e6cf;">${escapeHtml(e.servico)}</td>
+                                        <td style="color:#ffb347;">${escapeHtml(e.jogo || '')}</td>
+                                        <td>${escapeHtml(e.uid || '')}</td>
+                                        <td>${dataFormatada}</td>
+                                        <td>
+                                            <button onclick="moverCima('${e.id}')" class="btn btn-primary btn-sm">⬆️</button>
+                                            <button onclick="moverBaixo('${e.id}')" class="btn btn-primary btn-sm">⬇️</button>
+                                            <button onclick="concluir('${e.id}')" class="btn btn-success btn-sm">✅</button>
+                                            <button onclick="remover('${e.id}')" class="btn btn-danger btn-sm">❌</button>
+                                        </td>
+                                    </tr>
+                                `;
+                            }).join('');
+                        }
+                        if (fila.historico) {
+                            historicoCompleto = fila.historico;
+                            renderizarHistorico(historicoCompleto);
+                        }
                         const filaStatus = document.getElementById('fila-status');
-                        if (filaStatus) {{
-                            filaStatus.innerHTML = `Status: ${{fila.aberta ? '🟢 ABERTA' : '🔴 FECHADA'}} | ${{fila.contagem}}/${{fila.tamanho_maximo}}`;
-                        }}
+                        if (filaStatus) {
+                            filaStatus.innerHTML = `Status: ${fila.aberta ? '🟢 ABERTA' : '🔴 FECHADA'} | ${fila.contagem}/${fila.tamanho_maximo}`;
+                        }
                         const toggleBtn = document.getElementById('toggle-fila-btn');
-                        if (toggleBtn) {{
+                        if (toggleBtn) {
                             toggleBtn.className = fila.aberta ? 'btn btn-danger' : 'btn btn-success';
                             toggleBtn.textContent = fila.aberta ? '🔓 Fechar Fila' : '🔒 Abrir Fila';
-                        }}
-                    }}
-                }} catch(e) {{ console.error(e); }}
-            }}
+                        }
+                    }
+                } catch(e) { console.error(e); }
+            }
             
-            async function adicionarFila() {{
+            async function adicionarFila() {
                 const nome = document.getElementById('add-nome').value.trim();
                 const servico = document.getElementById('add-servico').value.trim();
                 const jogo = document.getElementById('add-jogo').value.trim();
-                if (!nome || !servico) {{
+                const uid = document.getElementById('add-uid').value.trim();
+                if (!nome || !servico) {
                     showAlert('add-result', 'Preencha nome e serviço', false);
                     return;
-                }}
-                try {{
-                    const resp = await fetch('/api/fila/adicionar', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{nome_usuario: nome, servico, jogo}})}});
+                }
+                try {
+                    const resp = await fetch('/api/fila/adicionar', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({nome_usuario: nome, servico, jogo, uid})});
                     const data = await resp.json();
                     showAlert('add-result', data.mensagem, data.sucesso);
-                    if (data.sucesso) {{
+                    if (data.sucesso) {
                         document.getElementById('add-nome').value = '';
                         document.getElementById('add-servico').value = '';
                         document.getElementById('add-jogo').value = '';
+                        document.getElementById('add-uid').value = '';
                         carregarFila();
-                    }}
-                }} catch(e) {{ showAlert('add-result', 'Erro: ' + e.message, false); }}
-            }}
+                    }
+                } catch(e) { showAlert('add-result', 'Erro: ' + e.message, false); }
+            }
             
-            async function remover(id) {{ if (confirm('Remover?')) {{ await fetch('/api/fila/remover', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{entrada_id:id}})}}); carregarFila(); }} }}
-            async function moverCima(id) {{ await fetch('/api/fila/mover-cima', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{entrada_id:id}})}}); carregarFila(); }}
-            async function moverBaixo(id) {{ await fetch('/api/fila/mover-baixo', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{entrada_id:id}})}}); carregarFila(); }}
-            async function concluir(id) {{ if (confirm('Concluir serviço?')) {{ await fetch('/api/fila/concluir', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{entrada_id:id}})}}); carregarFila(); }} }}
-            async function limparFila() {{ if (confirm('LIMPAR TODA A FILA?')) {{ await fetch('/api/fila/limpar', {{method:'POST'}}); carregarFila(); }} }}
-            async function salvarConfigFila() {{ 
-                const data = {{
+            async function remover(id) { if (confirm('Remover?')) { await fetch('/api/fila/remover', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({entrada_id:id})}); carregarFila(); } }
+            async function moverCima(id) { await fetch('/api/fila/mover-cima', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({entrada_id:id})}); carregarFila(); }
+            async function moverBaixo(id) { await fetch('/api/fila/mover-baixo', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({entrada_id:id})}); carregarFila(); }
+            async function concluir(id) { if (confirm('Concluir serviço?')) { await fetch('/api/fila/concluir', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({entrada_id:id})}); carregarFila(); } }
+            async function limparFila() { if (confirm('LIMPAR TODA A FILA?')) { await fetch('/api/fila/limpar', {method:'POST'}); carregarFila(); } }
+            async function salvarConfigFila() { 
+                const data = {
                     nome: document.getElementById('fila-nome').value,
                     tamanho_maximo: parseInt(document.getElementById('fila-max').value),
-                    discord_convite: document.getElementById('link-discord').value
-                }};
-                await fetch('/api/fila/configuracoes', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(data)}});
+                    discord_convite: document.getElementById('link-discord').value,
+                    pix_link: document.getElementById('pix-link').value
+                };
+                await fetch('/api/fila/configuracoes', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
                 carregarFila();
                 showAlert('fila-status', 'Configurações salvas!', true);
-            }}
-            async function alternarStatusFila() {{ await fetch('/api/fila/configuracoes', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{aberta:null}})}}); carregarFila(); }}
-            function atualizarFila() {{ carregarFila(); }}
+            }
+            async function alternarStatusFila() { await fetch('/api/fila/configuracoes', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({aberta:null})}); carregarFila(); }
+            function atualizarFila() { carregarFila(); }
             
-            function showAlert(id, msg, sucesso) {{
+            function showAlert(id, msg, sucesso) {
                 const el = document.getElementById(id);
                 if (!el) return;
                 el.textContent = msg;
                 el.className = 'alert ' + (sucesso ? 'alert-success' : 'alert-error');
                 el.style.display = 'block';
                 setTimeout(() => el.style.display = 'none', 3000);
-            }}
+            }
             
-            function escapeHtml(texto) {{ if (!texto) return ''; return texto.replace(/[&<>]/g, function(m) {{ if (m === '&') return '&amp;'; if (m === '<') return '&lt;'; if (m === '>') return '&gt;'; return m; }}); }}
+            function escapeHtml(texto) { if (!texto) return ''; return texto.replace(/[&<>]/g, function(m) { if (m === '&') return '&amp;'; if (m === '<') return '&lt;'; if (m === '>') return '&gt;'; return m; }); }
 
-            async function carregarPedidosPendentes() {{
-                try {{
+            async function carregarPedidosPendentes() {
+                try {
                     const resp = await fetch('/api/fidelidade/admin/pendentes');
                     const data = await resp.json();
                     const container = document.getElementById('pedidos-pendentes-container');
                     
-                    if (data.sucesso && data.pedidos.length > 0) {{
+                    if (data.sucesso && data.pedidos.length > 0) {
                         let html = '<table style="width:100%; color:white; border-collapse: collapse;">' +
                                    '<tr><th style="padding:8px; border-bottom:1px solid #444;">UID</th>' +
                                    '<th style="padding:8px; border-bottom:1px solid #444;">Discord</th>' +
@@ -3508,58 +3733,76 @@ def dashboard():
                                    '<th style="padding:8px; border-bottom:1px solid #444;">Valor</th>' +
                                    '<th style="padding:8px; border-bottom:1px solid #444;">Cupom</th>' +
                                    '<th style="padding:8px; border-bottom:1px solid #444;">Ações</th></tr>';
-                        data.pedidos.forEach(p => {{
+                        data.pedidos.forEach(p => {
                             html += `<tr>
-                                <td style="padding:8px; border-bottom:1px solid #333;">${{p.uid}}</td>
-                                <td style="padding:8px; border-bottom:1px solid #333;">${{escapeHtml(p.discord)}}</td>
-                                <td style="padding:8px; border-bottom:1px solid #333;">${{escapeHtml(p.servico)}}</td>
-                                <td style="padding:8px; border-bottom:1px solid #333;">${{escapeHtml(p.jogo || '-')}}</td>
-                                <td style="padding:8px; border-bottom:1px solid #333; color:#1dd1a1;">R$ ${{p.valor.toFixed(2)}}</td>
-                                <td style="padding:8px; border-bottom:1px solid #333; color:#feca57;">${{p.cupom_usado || 'Nenhum'}}</td>
+                                <td style="padding:8px; border-bottom:1px solid #333;">${p.uid}</td>
+                                <td style="padding:8px; border-bottom:1px solid #333;">${escapeHtml(p.discord)}</td>
+                                <td style="padding:8px; border-bottom:1px solid #333;">${escapeHtml(p.servico)}</td>
+                                <td style="padding:8px; border-bottom:1px solid #333;">${escapeHtml(p.jogo || '-')}</td>
+                                <td style="padding:8px; border-bottom:1px solid #333; color:#1dd1a1;">R$ ${p.valor.toFixed(2)}</td>
+                                <td style="padding:8px; border-bottom:1px solid #333; color:#feca57;">${p.cupom_usado || 'Nenhum'}</td>
                                 <td style="padding:8px; border-bottom:1px solid #333;">
-                                    <button onclick="aprovarPedido('${{p.id}}')" style="background:#2ed573; color:black; border:none; border-radius:3px; padding:5px 10px; cursor:pointer; font-weight:bold;">Aprovar</button>
-                                    <button onclick="recusarPedido('${{p.id}}')" style="background:#ff4757; color:white; border:none; border-radius:3px; padding:5px 10px; cursor:pointer;">Recusar</button>
+                                    <button onclick="aprovarPedido('${p.id}')" style="background:#2ed573; color:black; border:none; border-radius:3px; padding:5px 10px; cursor:pointer; font-weight:bold;">Aprovar</button>
+                                    <button onclick="recusarPedido('${p.id}')" style="background:#ff4757; color:white; border:none; border-radius:3px; padding:5px 10px; cursor:pointer;">Recusar</button>
                                 </td>
                             </tr>`;
-                        }});
+                        });
                         html += '</table>';
                         container.innerHTML = html;
-                    }} else {{
+                    } else {
                         container.innerHTML = '<p>Nenhum pedido pendente de aprovação.</p>';
-                    }}
-                }} catch(e) {{ console.error(e); }}
-            }}
+                    }
+                } catch(e) { console.error(e); }
+            }
 
-            async function aprovarPedido(id) {{
+            async function aprovarPedido(id) {
                 if(!confirm('Aprovar pedido e enviar para a Fila?')) return;
-                await fetch('/api/fidelidade/admin/aprovar', {{
+                await fetch('/api/fidelidade/admin/aprovar', {
                     method: 'POST',
-                    headers: {{'Content-Type': 'application/json'}},
-                    body: JSON.stringify({{pedido_id: id}})
-                }});
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({pedido_id: id})
+                });
                 carregarPedidosPendentes();
-                if (typeof carregarFila === 'function') carregarFila();
-            }}
+                carregarFila();
+            }
 
-            async function recusarPedido(id) {{
+            async function recusarPedido(id) {
                 if(!confirm('Recusar pedido?')) return;
-                await fetch('/api/fidelidade/admin/recusar', {{
+                await fetch('/api/fidelidade/admin/recusar', {
                     method: 'POST',
-                    headers: {{'Content-Type': 'application/json'}},
-                    body: JSON.stringify({{pedido_id: id}})
-                }});
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({pedido_id: id})
+                });
                 carregarPedidosPendentes();
-            }}
+            }
             
-            document.addEventListener('DOMContentLoaded', function() {{
+            document.addEventListener('DOMContentLoaded', function() {
                 carregarDados();
                 carregarPedidosPendentes();
                 carregarRecompensas();
-            }});
+            });
         </script>
     </body>
     </html>
-    '''
+    """,
+    usuario=usuario,
+    total_usuarios_xp=total_usuarios_xp,
+    total_advertencias=total_advertencias,
+    total_fila=total_fila,
+    status_bot=status_bot,
+    processador_status=processador_status,
+    anti_spam_status=anti_spam_status,
+    total_recompensas=total_recompensas,
+    anti_spam=anti_spam,
+    fila=fila,
+    links=links,
+    pix_link=pix_link,
+    botoes_precos_json=json.dumps(botoes_precos),
+    recompensas_json=json.dumps(recompensas),
+    historico_json=json.dumps(historico),
+    acoes_fila_bot=acoes_fila_bot,
+    config=config,
+    escape_html=escape_html)
 
 
 @app.route("/api/membro/advertencias")
@@ -3576,16 +3819,12 @@ def api_membro_advertencias():
 # ========================
 
 async def verificar_canal_permitido(interaction: discord.Interaction, comando: str) -> bool:
-    """Verifica se o comando pode ser usado no canal atual"""
     config = dados.get("config", {})
     canal_permitido = config.get(f"canal_{comando}", None)
-
     if not canal_permitido:
         return True
-
     if str(interaction.channel_id) == str(canal_permitido):
         return True
-
     return False
 
 
