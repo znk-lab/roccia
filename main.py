@@ -23,8 +23,8 @@ from PIL import Image, ImageDraw, ImageFont
 # ========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_USER = os.getenv("GITHUB_USER", "znk-lab")
-GITHUB_REPO = os.getenv("GITHUB_REPO", "roccia")
+GITHUB_USER = os.getenv("GITHUB_USER", "pobonsanto-byte")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "imune-bot-data")
 DATA_FILE = os.getenv("DATA_FILE", "data.json")
 BRANCH = os.getenv("GITHUB_BRANCH", "main")
 PORT = int(os.getenv("PORT", 8080))
@@ -953,6 +953,15 @@ def home():
     </html>
     """, status_bot=status_bot, classe_bot=classe_bot, session=session)
 
+
+@app.route("/health")
+def health():
+    status = {
+        "status": "ok",
+        "bot_ready": bot.is_ready() if bot else False,
+        "timestamp": agora_br().isoformat()
+    }
+    return jsonify(status), 200
 
 @app.route("/login")
 def login():
